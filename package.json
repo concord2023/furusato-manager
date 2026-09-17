@@ -1,0 +1,1 @@
+{"name":"furusato-manager","private":true,"version":"1.0.0","scripts":{"test":"node tests/run-tests.js","start":"node server.js"}}

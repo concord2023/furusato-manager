@@ -1,0 +1,42 @@
+// Data model and normalization for the ふるさと納税マネージャー.
+const FurusatoModel = (() => {
+  const DEFAULT = {
+    schemaVersion: 2, year: 2026, asOf: '2026-09-17', actualThrough: 9,
+    salaryRecords: Array.from({length:9},(_,i)=>({month:i+1,gross:[470000,465000,475000,470000,480000,470000,480000,480000,490000][i],source:'auto',status:'actual'})),
+    forecastSalary:[480000,480000,480000],
+    bonusRecords:[{date:'2026-07',amount:5550000,source:'pdf:1219856-Bonus-202607.pdf',status:'actual',document:'1219856-Bonus-202607.pdf',note:'第122期 後半期賞与'}],
+    forecastBonus:0,
+    bonusSocialRecords:[{date:'2026-07',amount:388387,source:'pdf:1219856-Bonus-202607.pdf',status:'actual',note:'雇用保険・健康保険・介護保険・子ども子育て支援金・年金保険の合計。持株会・所得税は含めない'}],
+    socialRecords:Array.from({length:9},(_,i)=>({month:i+1,amount:[68000,68000,69000,68000,69000,69000,70000,69000,70000][i],source:'auto',status:'actual'})),
+    forecastSocial:[69000,69000,69000],
+    deductions:{ideco:0,earthquake:0,other:0,basicOverride:null},
+    adjustments:{temporary:0,temporaryTaxable:true,otherIncome:0},
+    prior:{salary:0,bonus:0,social:0},
+    sourceDocuments:[{file:'1219856-Bonus-202607.pdf',type:'bonus_slip',status:'imported',note:'2026年7月賞与・支給合計5,550,000円'},{file:'1219856-Assets-202608.pdf',type:'asset_statement',status:'review_needed',note:'資産形成・DC等の記載あり。給与/控除には自動反映しない'}],
+    donations:[
+      {id:'r1',site:'楽天',city:'○○市',item:'米10kg',amount:30000,status:'確定',delivery:'9/27予定',orderId:'R-001',source:'sample'},
+      {id:'s1',site:'さとふる',city:'△△市',item:'牛肉',amount:20000,status:'確定',delivery:'9/30頃',orderId:'S-001',source:'sample'},
+      {id:'c1',site:'ふるさとチョイス',city:'□□市',item:'果物',amount:15000,status:'確定',delivery:'10月上旬',orderId:'C-001',source:'sample'},
+      {id:'a1',site:'Amazon等',city:'確認待ち',item:'その他',amount:10000,status:'確認待ち',delivery:'未確定',orderId:'',source:'sample'}
+    ]
+  };
+  const clone=x=>JSON.parse(JSON.stringify(x));
+  function merge(a,b){for(const k in b){if(b[k]&&typeof b[k]==='object'&&!Array.isArray(b[k])&&a[k]&&typeof a[k]==='object'&&!Array.isArray(a[k]))a[k]=merge(a[k],b[k]);else a[k]=b[k]}return a}
+  function normalize(raw){
+    const s=merge(clone(DEFAULT),raw||{});
+    // One-time migration from the earlier demo bonus value. Do not overwrite manual data.
+    if(raw && raw.schemaVersion!==2 && Array.isArray(s.bonusRecords) && s.bonusRecords.length===1 && s.bonusRecords[0].source==='auto' && Number(s.bonusRecords[0].amount)===600000){
+      s.bonusRecords=[clone(DEFAULT.bonusRecords[0])];
+      s.forecastBonus=0;
+      s.bonusSocialRecords=clone(DEFAULT.bonusSocialRecords);
+    }
+    s.schemaVersion=2;
+    if(!s.salaryRecords?.length && Array.isArray(raw?.salary)) s.salaryRecords=raw.salary.map((gross,i)=>({month:i+1,gross,source:'auto',status:i+1<=9?'actual':'forecast'}));
+    return s;
+  }
+  function load(){try{return normalize(JSON.parse(localStorage.getItem('furusatoState')||'null'))}catch{return clone(DEFAULT)}}
+  function save(s){localStorage.setItem('furusatoState',JSON.stringify(normalize(s)))}
+  return {DEFAULT,clone,merge,normalize,load,save};
+})();
+if(typeof window!=='undefined') window.FurusatoModel=FurusatoModel;
+if(typeof module!=='undefined') module.exports=FurusatoModel;
