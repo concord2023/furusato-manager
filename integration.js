@@ -150,28 +150,77 @@ const FurusatoGoogleDrive = (() => {
   function normalizeLabel(s){return String(s||'').replace(/[\u3000\s]/g,'').replace(/[（）()]/g,'').toLowerCase()}
   function parseAmountToken(s){const t=String(s||'').replace(/[￥¥,\s]/g,'');return /^-?\d{3,}$/.test(t)?Number(t):null}
   function isAmountToken(s){return parseAmountToken(s)!=null}
+  function compactPdfText(text){return String(text||'').replace(/[\u00a0\u3000\s]/g,'').replace(/[（）()]/g,'').toLowerCase();}
+  function labelRegexVariants(label){
+    const raw=String(label||'');
+    const compact=normalizeLabel(raw);
+    const spaced=raw.split('').map(ch=>/[\u3040-\u30ff\u3400-\u9fff]/.test(ch)?`${ch}\\s*`:ch.replace(/[.*+?^${}()|[\]\\]/g,'\\$&')).join('');
+    return [raw.replace(/[.*+?^${}()|[\]\\]/g,'\\$&'),compact.replace(/[.*+?^${}()|[\]\\]/g,'\\$&'),spaced].filter(Boolean);
+  }
+  function rowGroups(items, tolerance=5){
+    const rows=[];
+    for(const it of (items||[]).filter(x=>String(x.str||'').trim()).sort((a,b)=>b.y-a.y||a.x-b.x)){
+      let row=rows.find(r=>Math.abs(r.y-it.y)<=tolerance);
+      if(!row){row={y:it.y,items:[]};rows.push(row)}
+      row.items.push(it);
+    }
+    rows.forEach(r=>r.items.sort((a,b)=>a.x-b.x));
+    return rows;
+  }
+  function findAmountInRowAfterLabel(items,label){
+    const wanted=normalizeLabel(label);
+    for(const row of rowGroups(items,7)){
+      const arr=row.items;
+      const normalized=arr.map(it=>normalizeLabel(it.str));
+      for(let i=0;i<arr.length;i++){
+        let joined='';
+        for(let end=i;end<arr.length && end<i+10;end++){
+          joined+=normalized[end];
+          if(joined.includes(wanted)){
+            const nums=arr.slice(end+1).filter(it=>isAmountToken(it.str));
+            if(nums.length)return parseAmountToken(nums[0].str);
+            break;
+          }
+        }
+      }
+    }
+    return null;
+  }
+
   function extractLabeledNumber(textOrPdf, labels){
     const text=typeof textOrPdf==='string'?textOrPdf:(textOrPdf?.text||''); const layout=textOrPdf?.pages;
     if(Array.isArray(layout)){
       for(const page of layout){
         const items=page||[];
         for(const label of labels||[]){
-          const wanted=normalizeLabel(label); const exact=items.filter(it=>normalizeLabel(it.str)===wanted); const labelsOnPage=exact.length?exact:items.filter(it=>normalizeLabel(it.str).includes(wanted));
+          const rowValue=findAmountInRowAfterLabel(items,label);
+          if(rowValue!=null)return rowValue;
+          const wanted=normalizeLabel(label);
+          const exact=items.filter(it=>normalizeLabel(it.str)===wanted);
+          const labelsOnPage=exact.length?exact:items.filter(it=>normalizeLabel(it.str).includes(wanted));
           for(const li of labelsOnPage){
-            const candidates=items.filter(it=>it!==li && isAmountToken(it.str) && Math.abs(it.y-li.y)<=18 && it.x>=li.x+Math.max(0,li.width)-4)
+            const candidates=items.filter(it=>it!==li && isAmountToken(it.str) && Math.abs(it.y-li.y)<=24 && it.x>=li.x-10)
               .map(it=>({it,d:Math.abs(it.y-li.y)*4+Math.max(0,it.x-(li.x+li.width))})).sort((a,b)=>a.d-b.d);
             if(candidates.length)return parseAmountToken(candidates[0].it.str);
-            const nearby=items.filter(it=>it!==li && isAmountToken(it.str) && Math.abs(it.x-(li.x+li.width))<260 && Math.abs(it.y-li.y)<=40)
+            const nearby=items.filter(it=>it!==li && isAmountToken(it.str) && Math.abs(it.x-(li.x+li.width))<360 && Math.abs(it.y-li.y)<=45)
               .map(it=>({it,d:Math.abs(it.y-li.y)*6+Math.abs(it.x-(li.x+li.width))})).sort((a,b)=>a.d-b.d);
             if(nearby.length)return parseAmountToken(nearby[0].it.str);
           }
         }
       }
     }
-    const s=cleanPdfText(text);
-    for(const label of labels||[]){const esc=String(label).replace(/[.*+?^${}()|[\]\\]/g,'\\$&');const m=s.match(new RegExp(esc+'(?:[^0-9]{0,24})([0-9][0-9,]{2,})','i'));if(m)return Number(m[1].replace(/,/g,''))}
+    const raw=cleanPdfText(text); const compact=compactPdfText(text);
+    for(const label of labels||[]){
+      for(const pattern of labelRegexVariants(label)){
+        const m=raw.match(new RegExp(pattern+'[^0-9]{0,80}([0-9][0-9,]{2,})','i'));
+        if(m)return Number(m[1].replace(/,/g,''));
+      }
+      const wanted=normalizeLabel(label); const idx=compact.indexOf(wanted);
+      if(idx>=0){const tail=compact.slice(idx+wanted.length,idx+wanted.length+100);const m=tail.match(/[^0-9]{0,30}([0-9][0-9,]{2,})/);if(m)return Number(m[1].replace(/,/g,''));}
+    }
     return null;
   }
+
   function parseSalaryComponents(text){
     const s=cleanPdfText(typeof text==='string'?text:text?.text||'');
     const taxableAmount=extractLabeledNumber(text,['課税対象額','Taxable Amount','課税支給額','Taxable Pay']);
@@ -295,6 +344,7 @@ const FurusatoGoogleDrive = (() => {
     result.salaryParsed++; state.salaryRecords=state.salaryRecords||[];
     state.salaryRecords=state.salaryRecords.filter(r=>Number(r.month)!==x.month||r.source==='manual');
     state.salaryRecords.push({year:targetYear,month:x.month,gross:x.taxableGross,taxableGross:x.taxableGross,grossTotal:x.grossTotal,nonTaxableTotal:x.nonTaxableTotal,components:x.components||[],source:'google-drive',status:'actual',document:f.name,driveFileId:f.id,needsReview:x.needsReview});
+    state.sourceDocuments=state.sourceDocuments||[]; const oldDoc=state.sourceDocuments.find(d=>d.driveFileId===f.id||d.file===f.name); const salaryDoc={file:f.name,type:'salary_slip',status:x.needsReview?'review_needed':'imported',source:'google-drive',driveFileId:f.id,year:x.year,month:x.month,taxableGross:x.taxableGross,grossTotal:x.grossTotal,nonTaxableTotal:x.nonTaxableTotal,social:x.social||0,note:x.needsReview?'給与明細を取得しましたが一部確認待ちです。':'給与明細を取得・解析しました。'}; if(oldDoc)Object.assign(oldDoc,salaryDoc); else state.sourceDocuments.push(salaryDoc);
     if(x.social!=null){state.socialRecords=state.socialRecords||[];state.socialRecords=state.socialRecords.filter(r=>Number(r.month)!==x.month||r.source==='manual');state.socialRecords.push({year:targetYear,month:x.month,amount:x.social,components:x.socialComponents||{},source:'google-drive',status:'actual',document:f.name,driveFileId:f.id,needsReview:false})}
     if(x.needsReview){result.review++;result.salaryReview++}result.added++;result.salaryImported++; return true;
   }
@@ -312,11 +362,13 @@ const FurusatoGoogleDrive = (() => {
     const files=await listCandidateFiles(targetYear);
     const result={files:files.length,added:0,review:0,skipped:0,errors:[],salaryCandidates:files.filter(f=>f.candidateType==='salary').length,salaryImported:0,salaryReview:0,salaryParsed:0,salaryRejected:0,candidates:files.map(f=>({name:f.name,type:f.candidateType,year:f.filenameYear}))};
     state.priorSalaryRecords=(state.priorSalaryRecords||[]).filter(x=>Number(x.year)===priorYear); state.priorBonusRecords=(state.priorBonusRecords||[]).filter(x=>Number(x.year)===priorYear); state.priorSocialRecords=(state.priorSocialRecords||[]).filter(x=>Number(x.year)===priorYear);
+    state.lastDriveFiles=files.map(f=>({id:f.id,name:f.name,mimeType:f.mimeType||'application/pdf',modifiedTime:f.modifiedTime||'',filenameYear:f.filenameYear,candidateType:f.candidateType}));
     for(const f of files){
       try{
         onProgress?.(`解析中: ${f.name}`); const buf=await downloadPdf(f.id),pdf=await pdfText(buf),text=pdf.text,detectedType=classifyPdfText(text,f.name),type=detectedType==='unknown' ? ({salary:'salary_slip',bonus:'bonus_slip',withholding:'withholding'}[f.candidateType]||detectedType) : detectedType;
+        const diag={name:f.name,id:f.id,candidateType:f.candidateType,type,filenameYear:f.filenameYear}; result.candidates.find(v=>v.name===f.name).detectedType=detectedType; result.candidates.find(v=>v.name===f.name).resolvedType=type;
         if(type==='salary_slip'){
-          const x=parseSalaryPdf(pdf,f.name); if(![targetYear,priorYear].includes(Number(x.year))){result.skipped++;continue}
+          const x=parseSalaryPdf(pdf,f.name); const cd=result.candidates.find(v=>v.name===f.name); if(cd)Object.assign(cd,{parsedYear:x.year,parsedMonth:x.month,taxableGross:x.taxableGross,grossTotal:x.grossTotal,social:x.social,needsReview:x.needsReview}); if(![targetYear,priorYear].includes(Number(x.year))){result.skipped++;continue}
           if(upsertSalaryRecord(state,x,f,targetYear,result)){}
           else if(x.year===priorYear&&x.month&&x.gross){uniquePush(state.priorSalaryRecords,{year:priorYear,month:x.month,gross:x.taxableGross,taxableGross:x.taxableGross,grossTotal:x.grossTotal,nonTaxableTotal:x.nonTaxableTotal,components:x.components||[],source:'google-drive',status:'prior',document:f.name,driveFileId:f.id,needsReview:x.needsReview},v=>`${v.year}-${v.month}-${v.document}`);if(x.social!=null)uniquePush(state.priorSocialRecords,{year:priorYear,month:x.month,amount:x.social,components:x.socialComponents||{},source:'google-drive',status:'prior',document:f.name,driveFileId:f.id},v=>`${v.year}-${v.month}-${v.document}`);result.added++}else {result.review++; if(f.candidateType==='salary'){result.salaryReview++;result.salaryRejected++;}}
         }else if(type==='bonus_slip'){
