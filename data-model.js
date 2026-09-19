@@ -1,7 +1,7 @@
 // Data model and normalization for the ふるさと納税マネージャー.
 const FurusatoModel = (() => {
   const DEFAULT = {
-    schemaVersion: 3, year: 2026, asOf: '2026-09-17', actualThrough: 9, importSettings:{targetYear:2026,priorYear:2025},
+    schemaVersion: 4, year: 2026, asOf: '2026-09-17', actualThrough: 9, importSettings:{targetYear:2026,priorYear:2025},
     salaryRecords: Array.from({length:9},(_,i)=>({month:i+1,gross:[470000,465000,475000,470000,480000,470000,480000,480000,490000][i],source:'auto',status:'actual'})),
     forecastSalary:[480000,480000,480000],
     forecastMethod:{salary:'2026年4〜9月実績平均',social:'2026年4〜9月実績平均',bonus:'対象年の未支給シーズンは前年同シーズン賞与を参考'},
@@ -12,6 +12,7 @@ const FurusatoModel = (() => {
     forecastSocial:[69000,69000,69000],
     deductions:{ideco:0,earthquake:0,other:0,basicOverride:null},
     adjustments:{temporary:0,temporaryTaxable:true,otherIncome:0},
+    taxableAdjustments:[],
     prior:{salary:0,bonus:0,social:0},
     sourceDocuments:[{file:'1219856-Bonus-202607.pdf',type:'bonus_slip',status:'imported',note:'2026年7月賞与・支給合計5,550,000円'},{file:'1219856-Assets-202608.pdf',type:'asset_statement',status:'review_needed',note:'資産形成・DC等の記載あり。給与/控除には自動反映しない'}],
     donations:[
@@ -31,10 +32,13 @@ const FurusatoModel = (() => {
       s.forecastBonus=0;
       s.bonusSocialRecords=clone(DEFAULT.bonusSocialRecords);
     }
-    s.schemaVersion=3;
+    s.schemaVersion=4;
     s.importSettings=s.importSettings||{targetYear:s.year||2026,priorYear:(s.year||2026)-1};
     s.importSettings.targetYear=Number(s.importSettings.targetYear)||Number(s.year)||2026;
     s.importSettings.priorYear=s.importSettings.targetYear-1;
+    s.salaryRecords=(s.salaryRecords||[]).map(r=>({...r,taxableGross:r.taxableGross==null?Number(r.gross)||0:Number(r.taxableGross)}));
+    s.taxableAdjustments=Array.isArray(s.taxableAdjustments)?s.taxableAdjustments:[];
+    s.bonusSocialRecords=Array.isArray(s.bonusSocialRecords)?s.bonusSocialRecords:[];
     if(!s.salaryRecords?.length && Array.isArray(raw?.salary)) s.salaryRecords=raw.salary.map((gross,i)=>({month:i+1,gross,source:'auto',status:i+1<=9?'actual':'forecast'}));
     return s;
   }
