@@ -1,7 +1,7 @@
 // Data model and normalization for the ふるさと納税マネージャー.
 const FurusatoModel = (() => {
   const DEFAULT = {
-    schemaVersion: 6, year: 2026, asOf: '2026-09-17', actualThrough: 9, importSettings:{targetYear:2026,priorYear:2025},
+    schemaVersion: 5, year: 2026, asOf: '2026-09-17', actualThrough: 9, importSettings:{targetYear:2026,priorYear:2025}, importHistory:[],
     salaryRecords: [],
     forecastSalary: [],
     forecastMethod:{salary:'2026年4〜9月実績平均',social:'2026年4〜9月実績平均',bonus:'対象年の未支給シーズンは前年同シーズン賞与を参考'},
@@ -14,7 +14,7 @@ const FurusatoModel = (() => {
     adjustments:{temporary:0,temporaryTaxable:true,otherIncome:0},
     taxableAdjustments:[],
     prior:{salary:0,bonus:0,social:0},
-    lastDriveFiles:[], importDiagnostics:{}, sourceDocuments:[{file:'1219856-Bonus-202607.pdf',type:'bonus_slip',status:'imported',note:'2026年7月賞与・支給合計5,550,000円'},{file:'1219856-Assets-202608.pdf',type:'asset_statement',status:'review_needed',note:'資産形成・DC等の記載あり。給与/控除には自動反映しない'}],
+    sourceDocuments:[{file:'1219856-Bonus-202607.pdf',type:'bonus_slip',status:'imported',note:'2026年7月賞与・支給合計5,550,000円'},{file:'1219856-Assets-202608.pdf',type:'asset_statement',status:'review_needed',note:'資産形成・DC等の記載あり。給与/控除には自動反映しない'}],
     donations:[
       {id:'r1',site:'楽天',city:'○○市',item:'米10kg',amount:30000,status:'確定',delivery:'9/27予定',orderId:'R-001',source:'sample'},
       {id:'s1',site:'さとふる',city:'△△市',item:'牛肉',amount:20000,status:'確定',delivery:'9/30頃',orderId:'S-001',source:'sample'},
@@ -49,9 +49,7 @@ const FurusatoModel = (() => {
       s.forecastBonus=0;
       s.bonusSocialRecords=clone(DEFAULT.bonusSocialRecords);
     }
-    s.schemaVersion=6;
-    s.lastDriveFiles=Array.isArray(s.lastDriveFiles)?s.lastDriveFiles:[];
-    s.importDiagnostics=s.importDiagnostics||{};
+    s.schemaVersion=5;
     s.importSettings=s.importSettings||{targetYear:s.year||2026,priorYear:(s.year||2026)-1};
     s.importSettings.targetYear=Number(s.importSettings.targetYear)||Number(s.year)||2026;
     s.importSettings.priorYear=s.importSettings.targetYear-1;
@@ -61,8 +59,9 @@ const FurusatoModel = (() => {
     if(!s.salaryRecords?.length && Array.isArray(raw?.salary)) s.salaryRecords=raw.salary.map((gross,i)=>({month:i+1,gross,source:'auto',status:i+1<=9?'actual':'forecast'}));
     return s;
   }
-  function load(){try{return normalize(JSON.parse(localStorage.getItem('furusatoState')||'null'))}catch{return clone(DEFAULT)}}
-  function save(s){localStorage.setItem('furusatoState',JSON.stringify(normalize(s)))}
+  const IMPORT_HISTORY_KEY='furusatoImportHistory';
+  function load(){try{const raw=JSON.parse(localStorage.getItem('furusatoState')||'null');const s=normalize(raw);const h=JSON.parse(localStorage.getItem(IMPORT_HISTORY_KEY)||'null');if(Array.isArray(h))s.importHistory=h.slice(0,200);return s}catch{return clone(DEFAULT)}}
+  function save(s){const n=normalize(s);const h=Array.isArray(n.importHistory)?n.importHistory.slice(0,200):[];localStorage.setItem('furusatoState',JSON.stringify(n));localStorage.setItem(IMPORT_HISTORY_KEY,JSON.stringify(h))}
   return {DEFAULT,clone,merge,normalize,load,save};
 })();
 if(typeof window!=='undefined') window.FurusatoModel=FurusatoModel;
