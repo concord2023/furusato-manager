@@ -2,14 +2,14 @@
 const FurusatoModel = (() => {
   const DEFAULT = {
     schemaVersion: 4, year: 2026, asOf: '2026-09-17', actualThrough: 9, importSettings:{targetYear:2026,priorYear:2025},
-    salaryRecords: Array.from({length:9},(_,i)=>({month:i+1,gross:[470000,465000,475000,470000,480000,470000,480000,480000,490000][i],source:'auto',status:'actual'})),
-    forecastSalary:[480000,480000,480000],
+    salaryRecords: [],
+    forecastSalary: [],
     forecastMethod:{salary:'2026年4〜9月実績平均',social:'2026年4〜9月実績平均',bonus:'対象年の未支給シーズンは前年同シーズン賞与を参考'},
     bonusRecords:[{date:'2026-07',amount:5550000,source:'pdf:1219856-Bonus-202607.pdf',status:'actual',document:'1219856-Bonus-202607.pdf',note:'第122期 後半期賞与'}],
     forecastBonus:0,
     bonusSocialRecords:[{date:'2026-07',amount:388387,source:'pdf:1219856-Bonus-202607.pdf',status:'actual',note:'雇用保険・健康保険・介護保険・子ども子育て支援金・年金保険の合計。持株会・所得税は含めない'}],
-    socialRecords:Array.from({length:9},(_,i)=>({month:i+1,amount:[68000,68000,69000,68000,69000,69000,70000,69000,70000][i],source:'auto',status:'actual'})),
-    forecastSocial:[69000,69000,69000],
+    socialRecords:[],
+    forecastSocial:[],
     deductions:{ideco:0,earthquake:0,other:0,basicOverride:null},
     adjustments:{temporary:0,temporaryTaxable:true,otherIncome:0},
     taxableAdjustments:[],
@@ -26,13 +26,30 @@ const FurusatoModel = (() => {
   function merge(a,b){for(const k in b){if(b[k]&&typeof b[k]==='object'&&!Array.isArray(b[k])&&a[k]&&typeof a[k]==='object'&&!Array.isArray(a[k]))a[k]=merge(a[k],b[k]);else a[k]=b[k]}return a}
   function normalize(raw){
     const s=merge(clone(DEFAULT),raw||{});
+    // Remove the old built-in demo salary/social records from existing browser storage.
+    // They are not user data: their exact 470000/465000/... sequence was shipped as sample data
+    // and must never appear as if it had been automatically read from a payroll PDF.
+    const demoSalary=[470000,465000,475000,470000,480000,470000,480000,480000,490000];
+    const rawSalary=Array.isArray(raw?.salaryRecords)?raw.salaryRecords:[];
+    const isDemoSalary=rawSalary.length===9 && rawSalary.every((r,i)=>Number(r?.gross)===demoSalary[i] && (r?.source==='auto'||r?.source==null) && r?.status==='actual');
+    if(isDemoSalary){
+      s.salaryRecords=[];
+      s.forecastSalary=[];
+    }
+    const demoSocial=[68000,68000,69000,68000,69000,69000,70000,69000,70000];
+    const rawSocial=Array.isArray(raw?.socialRecords)?raw.socialRecords:[];
+    const isDemoSocial=rawSocial.length===9 && rawSocial.every((r,i)=>Number(r?.amount)===demoSocial[i] && (r?.source==='auto'||r?.source==null) && r?.status==='actual');
+    if(isDemoSocial){
+      s.socialRecords=[];
+      s.forecastSocial=[];
+    }
     // One-time migration from the earlier demo bonus value. Do not overwrite manual data.
     if(raw && raw.schemaVersion!==2 && Array.isArray(s.bonusRecords) && s.bonusRecords.length===1 && s.bonusRecords[0].source==='auto' && Number(s.bonusRecords[0].amount)===600000){
       s.bonusRecords=[clone(DEFAULT.bonusRecords[0])];
       s.forecastBonus=0;
       s.bonusSocialRecords=clone(DEFAULT.bonusSocialRecords);
     }
-    s.schemaVersion=4;
+    s.schemaVersion=5;
     s.importSettings=s.importSettings||{targetYear:s.year||2026,priorYear:(s.year||2026)-1};
     s.importSettings.targetYear=Number(s.importSettings.targetYear)||Number(s.year)||2026;
     s.importSettings.priorYear=s.importSettings.targetYear-1;
