@@ -53,7 +53,7 @@ const FurusatoModel = (() => {
     s.importSettings=s.importSettings||{targetYear:s.year||2026,priorYear:(s.year||2026)-1};
     s.importSettings.targetYear=Number(s.importSettings.targetYear)||Number(s.year)||2026;
     s.importSettings.priorYear=s.importSettings.targetYear-1;
-    s.salaryRecords=(s.salaryRecords||[]).map(r=>({...r,taxableGross:r.taxableGross==null?Number(r.gross)||0:Number(r.taxableGross)}));
+    s.salaryRecords=(s.salaryRecords||[]).map(r=>({...r,taxableGross:r.taxableGross==null?Number(r.gross)||0:Number(r.taxableGross)})).filter(r=>Number(r.taxableGross)>0 || r.source==='manual');
     s.taxableAdjustments=Array.isArray(s.taxableAdjustments)?s.taxableAdjustments:[];
     s.bonusSocialRecords=Array.isArray(s.bonusSocialRecords)?s.bonusSocialRecords:[];
     if(!s.salaryRecords?.length && Array.isArray(raw?.salary)) s.salaryRecords=raw.salary.map((gross,i)=>({month:i+1,gross,source:'auto',status:i+1<=9?'actual':'forecast'}));
