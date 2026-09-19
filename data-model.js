@@ -1,7 +1,7 @@
 // Data model and normalization for the ふるさと納税マネージャー.
 const FurusatoModel = (() => {
   const DEFAULT = {
-    schemaVersion: 6, year: 2026, asOf: '2026-09-17', actualThrough: 9, importSettings:{targetYear:2026,priorYear:2025}, importHistory:[],
+    schemaVersion: 7, year: 2026, asOf: '2026-09-17', actualThrough: 9, importSettings:{targetYear:2026,priorYear:2025}, importHistory:[],
     salaryRecords: [],
     forecastSalary: [],
     forecastMethod:{salary:'2026年4〜9月実績平均',social:'2026年4〜9月実績平均',bonus:'対象年の未支給シーズンは前年同シーズン賞与を参考'},
@@ -49,7 +49,7 @@ const FurusatoModel = (() => {
       s.forecastBonus=0;
       s.bonusSocialRecords=clone(DEFAULT.bonusSocialRecords);
     }
-    s.schemaVersion=6;
+    s.schemaVersion=7;
     s.importSettings=s.importSettings||{targetYear:s.year||2026,priorYear:(s.year||2026)-1};
     s.importSettings.targetYear=Number(s.importSettings.targetYear)||Number(s.year)||2026;
     s.importSettings.priorYear=s.importSettings.targetYear-1;
@@ -60,8 +60,33 @@ const FurusatoModel = (() => {
     return s;
   }
   const IMPORT_HISTORY_KEY='furusatoImportHistory';
-  function load(){try{const raw=JSON.parse(localStorage.getItem('furusatoState')||'null');const s=normalize(raw);const h=JSON.parse(localStorage.getItem(IMPORT_HISTORY_KEY)||'null');if(Array.isArray(h))s.importHistory=h.slice(0,200);return s}catch{return clone(DEFAULT)}}
-  function save(s){const n=normalize(s);const h=Array.isArray(n.importHistory)?n.importHistory.slice(0,200):[];localStorage.setItem('furusatoState',JSON.stringify(n));localStorage.setItem(IMPORT_HISTORY_KEY,JSON.stringify(h))}
+  const STATE_BACKUP_KEY='furusatoStateBackup';
+  function safeRead(key){try{return localStorage.getItem(key)}catch{return null}}
+  function safeWrite(key,value){try{localStorage.setItem(key,value);return true}catch{return false}}
+  function load(){
+    try{
+      const primary=safeRead('furusatoState');
+      const backup=safeRead(STATE_BACKUP_KEY);
+      let raw=null;
+      if(primary){try{raw=JSON.parse(primary)}catch{raw=null}}
+      if(!raw&&backup){try{raw=JSON.parse(backup)}catch{raw=null}}
+      const s=normalize(raw);
+      const hRaw=safeRead(IMPORT_HISTORY_KEY);
+      if(hRaw){try{const h=JSON.parse(hRaw);if(Array.isArray(h))s.importHistory=h.slice(0,200)}catch{}}
+      return s;
+    }catch{return clone(DEFAULT)}
+  }
+  function save(s){
+    const n=normalize(s);
+    const json=JSON.stringify(n);
+    const h=Array.isArray(n.importHistory)?n.importHistory.slice(0,200):[];
+    // Keep a second state copy so a malformed/partial primary write cannot
+    // make another tab appear to have reset the application.
+    safeWrite(STATE_BACKUP_KEY,json);
+    safeWrite('furusatoState',json);
+    safeWrite(IMPORT_HISTORY_KEY,JSON.stringify(h));
+    return n;
+  }
   return {DEFAULT,clone,merge,normalize,load,save};
 })();
 if(typeof window!=='undefined') window.FurusatoModel=FurusatoModel;

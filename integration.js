@@ -330,65 +330,81 @@ const FurusatoGoogleDrive = (() => {
     const wanted=(labels||[]).map(normalizeLabel).filter(Boolean);
     const layout=textOrPdf?.pages;
     const text=typeof textOrPdf==='string'?textOrPdf:(textOrPdf?.text||'');
-    const hits=[];
+    const toAmount=(s)=>{
+      const raw=String(s||'').replace(/[￥¥\s\u3000]/g,' ');
+      const matches=raw.match(/(?<![\d,])(?:\d{1,3}(?:,\d{3})+|\d{3,})(?![\d,])/g)||[];
+      for(const token of matches){
+        const n=Number(token.replace(/,/g,''));
+        if(Number.isFinite(n)&&n>=100&&n<1000000000&&!(n>=1900&&n<=2100))return n;
+      }
+      return null;
+    };
     if(Array.isArray(layout)){
+      const allLines=[];
       for(const page of layout){
         const items=(page||[]).filter(it=>String(it.str||'').trim()).map(it=>({...it,str:String(it.str||'').trim()}));
         const lines=[];
         for(const it of items){
-          let line=lines.find(g=>Math.abs(g.y-it.y)<=5);
-          if(!line){line={y:it.y,items:[]};lines.push(line)}
-          line.items.push(it);
+          let g=lines.find(x=>Math.abs(x.y-it.y)<=5);
+          if(!g){g={y:it.y,items:[]};lines.push(g)}
+          g.items.push(it);
         }
-        for(const line of lines){
+        for(const g of lines)allLines.push(g);
+      }
+      // IMPORTANT: evaluate each requested label independently. The previous
+      // implementation mixed hits from different labels, so asking for
+      // 「課税対象額」 could accidentally return the nearby
+      // 「非課税額」/「通勤費」 value. That is exactly the kind of silent
+      // misread that can turn a real salary into the wrong number.
+      for(const label of wanted){
+        const hits=[];
+        for(const line of allLines){
           const ordered=line.items.slice().sort((a,b)=>a.x-b.x);
           for(let i=0;i<ordered.length;i++){
             let acc='';
-            for(let j=i;j<Math.min(ordered.length,i+16);j++){
+            for(let j=i;j<Math.min(ordered.length,i+20);j++){
               acc+=ordered[j].str;
-              const norm=normalizeLabel(acc);
-              if(wanted.some(w=>norm.includes(w))){
-                hits.push({x:ordered[j].x+ordered[j].width,y:line.y,line});
+              if(normalizeLabel(acc).includes(label)){
+                hits.push({x:ordered[j].x+ordered[j].width,y:line.y});
                 break;
               }
             }
           }
         }
-      }
-      // The Toyota payroll summary has the relevant values at the bottom-left.
-      // If the same label appears in the header (for example the explanatory
-      // "各種手当の課税対象額"), prefer the lowest y hit and search nearby rows.
-      hits.sort((a,b)=>a.y-b.y);
-      for(const hit of hits){
-        const candidates=[];
-        for(const line of (layout||[]).flatMap(p=>{
-          const its=(p||[]).filter(it=>String(it.str||'').trim());
-          const ls=[];
-          for(const it of its){let g=ls.find(x=>Math.abs(x.y-it.y)<=5);if(!g){g={y:it.y,items:[]};ls.push(g)}g.items.push(it)}
-          return ls;
-        })){
-          const dy=Math.abs(line.y-hit.y); if(dy>28)continue;
-          for(const it of line.items){
-            const n=toAmount(it.str); if(n==null)continue;
-            const dx=it.x-hit.x;
-            if(dx>=-15&&dx<=380)candidates.push({n,score:dy*100+Math.max(0,dx)});
+        // PDF coordinates usually increase upward, so lower y is physically
+        // lower on the page. Prefer the actual summary block, but only after
+        // requiring a nearby numeric value for THIS label.
+        hits.sort((a,b)=>a.y-b.y);
+        for(const hit of hits){
+          const candidates=[];
+          for(const line of allLines){
+            const dy=Math.abs(line.y-hit.y);
+            if(dy>28)continue;
+            for(const it of line.items){
+              const n=toAmount(it.str); if(n==null)continue;
+              const dx=it.x-hit.x;
+              if(dx>=-15&&dx<=380)candidates.push({n,score:dy*100+Math.max(0,dx)});
+            }
           }
+          candidates.sort((a,b)=>a.score-b.score);
+          if(candidates.length)return candidates[0].n;
         }
-        candidates.sort((a,b)=>a.score-b.score);
-        if(candidates.length)return candidates[0].n;
       }
     }
-    // Text-only fallback with a bounded window. Never allow a date/year to be
-    // glued to the preceding payroll amount.
     const compact=String(text||'').replace(/[\u3000\s]+/g,'').toLowerCase();
     for(const label of wanted){
-      const re=new RegExp(label.replace(/[.*+?^${}()|[\]\\]/g,'\\$&')+'[^\\d]{0,20}((?:\\d{1,3}(?:,\\d{3})+|\\d{3,}))','i');
-      const m=compact.match(re);
-      if(m){const n=Number(m[1].replace(/,/g,''));if(Number.isFinite(n)&&!(n>=1900&&n<=2100))return n;}
+      let from=0;
+      while(true){
+        const idx=compact.indexOf(label,from);
+        if(idx<0)break;
+        const tail=compact.slice(idx+label.length,idx+label.length+24);
+        const m=tail.match(/((?:\d{1,3}(?:,\d{3})+|\d{3,}))/);
+        if(m){const n=Number(m[1].replace(/,/g,''));if(Number.isFinite(n)&&n>=100&&!(n>=1900&&n<=2100))return n;}
+        from=idx+label.length;
+      }
     }
     return null;
   }
-
   function parseSalaryComponents(text){
     const s=cleanPdfText(typeof text==='string'?text:text?.text||'');
     const taxableAmount=extractToyotaPayrollAmount(text,['課税対象額','Taxable Amount','課税支給額','Taxable Pay']);
