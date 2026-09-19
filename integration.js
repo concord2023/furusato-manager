@@ -120,7 +120,13 @@ const FurusatoGoogleDrive = (() => {
     if(!window.pdfjsLib)await loadScript('https://cdnjs.cloudflare.com/ajax/libs/pdf.js/3.11.174/pdf.min.js');
     const pdf=window.pdfjsLib||window.pdfjs;if(!pdf)throw new Error('PDF解析ライブラリを読み込めませんでした');
     if(pdf.GlobalWorkerOptions)pdf.GlobalWorkerOptions.workerSrc='https://cdnjs.cloudflare.com/ajax/libs/pdf.js/3.11.174/pdf.worker.min.js';
-    const doc=await pdf.getDocument({data:arrayBuffer}).promise; let text=''; const pages=[];
+    let doc;
+    try{doc=await pdf.getDocument({data:arrayBuffer,disableWorker:true}).promise}
+    catch(first){
+      if(pdf.GlobalWorkerOptions)pdf.GlobalWorkerOptions.workerSrc='https://cdnjs.cloudflare.com/ajax/libs/pdf.js/3.11.174/pdf.worker.min.js';
+      doc=await pdf.getDocument({data:arrayBuffer}).promise;
+    }
+    let text=''; const pages=[];
     for(let i=1;i<=doc.numPages;i++){
       const page=await doc.getPage(i); const c=await page.getTextContent();
       const items=(c.items||[]).filter(x=>String(x.str||'').trim()).map(x=>({str:String(x.str||''),x:Number(x.transform?.[4]||0),y:Number(x.transform?.[5]||0),width:Number(x.width||0),height:Number(x.height||0)}));
@@ -149,6 +155,24 @@ const FurusatoGoogleDrive = (() => {
   }
   function normalizeLabel(s){return String(s||'').replace(/[\u3000\s]/g,'').replace(/[（）()]/g,'').toLowerCase()}
   function parseAmountToken(s){const t=String(s||'').replace(/[￥¥,\s]/g,'');return /^-?\d{3,}$/.test(t)?Number(t):null}
+  function numericTokens(items){
+    const arr=(items||[]).filter(x=>String(x.str||'').trim()); const out=[];
+    for(let i=0;i<arr.length;i++){
+      const raw=String(arr[i].str||'').trim();
+      const one=parseAmountToken(raw);
+      if(one!=null){out.push({it:arr[i],value:one});continue}
+      if(/^[0-9]{1,3}$/.test(raw)){
+        let joined=raw, end=i;
+        while(end+1<arr.length && end-i<5 && /^[0-9,]+$/.test(String(arr[end+1].str||'').trim())){
+          const next=String(arr[end+1].str||'').trim();
+          if(joined.length+next.replace(/,/g,'').length>9)break;
+          joined+=next; end++;
+          const v=parseAmountToken(joined); if(v!=null){out.push({it:arr[i],value:v,end});i=end;break}
+        }
+      }
+    }
+    return out;
+  }
   function isAmountToken(s){return parseAmountToken(s)!=null}
   function compactPdfText(text){return String(text||'').replace(/[\u00a0\u3000\s]/g,'').replace(/[（）()]/g,'').toLowerCase();}
   function labelRegexVariants(label){
@@ -177,8 +201,8 @@ const FurusatoGoogleDrive = (() => {
         for(let end=i;end<arr.length && end<i+10;end++){
           joined+=normalized[end];
           if(joined.includes(wanted)){
-            const nums=arr.slice(end+1).filter(it=>isAmountToken(it.str));
-            if(nums.length)return parseAmountToken(nums[0].str);
+            const nums=numericTokens(arr.slice(end+1));
+            if(nums.length)return nums[0].value;
             break;
           }
         }
@@ -199,12 +223,12 @@ const FurusatoGoogleDrive = (() => {
           const exact=items.filter(it=>normalizeLabel(it.str)===wanted);
           const labelsOnPage=exact.length?exact:items.filter(it=>normalizeLabel(it.str).includes(wanted));
           for(const li of labelsOnPage){
-            const candidates=items.filter(it=>it!==li && isAmountToken(it.str) && Math.abs(it.y-li.y)<=24 && it.x>=li.x-10)
-              .map(it=>({it,d:Math.abs(it.y-li.y)*4+Math.max(0,it.x-(li.x+li.width))})).sort((a,b)=>a.d-b.d);
-            if(candidates.length)return parseAmountToken(candidates[0].it.str);
-            const nearby=items.filter(it=>it!==li && isAmountToken(it.str) && Math.abs(it.x-(li.x+li.width))<360 && Math.abs(it.y-li.y)<=45)
-              .map(it=>({it,d:Math.abs(it.y-li.y)*6+Math.abs(it.x-(li.x+li.width))})).sort((a,b)=>a.d-b.d);
-            if(nearby.length)return parseAmountToken(nearby[0].it.str);
+            const candidates=numericTokens(items.filter(it=>it!==li && Math.abs(it.y-li.y)<=24 && it.x>=li.x-10))
+              .map(n=>({it:n.it,value:n.value,d:Math.abs(n.it.y-li.y)*4+Math.max(0,n.it.x-(li.x+li.width))})).sort((a,b)=>a.d-b.d);
+            if(candidates.length)return candidates[0].value;
+            const nearby=numericTokens(items.filter(it=>it!==li && Math.abs(it.x-(li.x+li.width))<500 && Math.abs(it.y-li.y)<=45))
+              .map(n=>({it:n.it,value:n.value,d:Math.abs(n.it.y-li.y)*6+Math.abs(n.it.x-(li.x+li.width))})).sort((a,b)=>a.d-b.d);
+            if(nearby.length)return nearby[0].value;
           }
         }
       }
@@ -343,7 +367,7 @@ const FurusatoGoogleDrive = (() => {
     if(!(x.year===targetYear&&x.month&&Number(x.taxableGross)>0))return false;
     result.salaryParsed++; state.salaryRecords=state.salaryRecords||[];
     state.salaryRecords=state.salaryRecords.filter(r=>Number(r.month)!==x.month||r.source==='manual');
-    state.salaryRecords.push({year:targetYear,month:x.month,gross:x.taxableGross,taxableGross:x.taxableGross,grossTotal:x.grossTotal,nonTaxableTotal:x.nonTaxableTotal,components:x.components||[],source:'google-drive',status:'actual',document:f.name,driveFileId:f.id,needsReview:x.needsReview});
+    state.salaryRecords.push({year:targetYear,month:x.month,gross:x.taxableGross,taxableGross:x.taxableGross,grossTotal:x.grossTotal,nonTaxableTotal:x.nonTaxableTotal,social:x.social,socialComponents:x.socialComponents||{},components:x.components||[],source:'google-drive',status:'actual',document:f.name,driveFileId:f.id,needsReview:x.needsReview});
     state.sourceDocuments=state.sourceDocuments||[]; const oldDoc=state.sourceDocuments.find(d=>d.driveFileId===f.id||d.file===f.name); const salaryDoc={file:f.name,type:'salary_slip',status:x.needsReview?'review_needed':'imported',source:'google-drive',driveFileId:f.id,year:x.year,month:x.month,taxableGross:x.taxableGross,grossTotal:x.grossTotal,nonTaxableTotal:x.nonTaxableTotal,social:x.social||0,note:x.needsReview?'給与明細を取得しましたが一部確認待ちです。':'給与明細を取得・解析しました。'}; if(oldDoc)Object.assign(oldDoc,salaryDoc); else state.sourceDocuments.push(salaryDoc);
     if(x.social!=null){state.socialRecords=state.socialRecords||[];state.socialRecords=state.socialRecords.filter(r=>Number(r.month)!==x.month||r.source==='manual');state.socialRecords.push({year:targetYear,month:x.month,amount:x.social,components:x.socialComponents||{},source:'google-drive',status:'actual',document:f.name,driveFileId:f.id,needsReview:false})}
     if(x.needsReview){result.review++;result.salaryReview++}result.added++;result.salaryImported++; return true;
@@ -370,7 +394,13 @@ const FurusatoGoogleDrive = (() => {
         if(type==='salary_slip'){
           const x=parseSalaryPdf(pdf,f.name); const cd=result.candidates.find(v=>v.name===f.name); if(cd)Object.assign(cd,{parsedYear:x.year,parsedMonth:x.month,taxableGross:x.taxableGross,grossTotal:x.grossTotal,social:x.social,needsReview:x.needsReview}); if(![targetYear,priorYear].includes(Number(x.year))){result.skipped++;continue}
           if(upsertSalaryRecord(state,x,f,targetYear,result)){}
-          else if(x.year===priorYear&&x.month&&x.gross){uniquePush(state.priorSalaryRecords,{year:priorYear,month:x.month,gross:x.taxableGross,taxableGross:x.taxableGross,grossTotal:x.grossTotal,nonTaxableTotal:x.nonTaxableTotal,components:x.components||[],source:'google-drive',status:'prior',document:f.name,driveFileId:f.id,needsReview:x.needsReview},v=>`${v.year}-${v.month}-${v.document}`);if(x.social!=null)uniquePush(state.priorSocialRecords,{year:priorYear,month:x.month,amount:x.social,components:x.socialComponents||{},source:'google-drive',status:'prior',document:f.name,driveFileId:f.id},v=>`${v.year}-${v.month}-${v.document}`);result.added++}else {result.review++; if(f.candidateType==='salary'){result.salaryReview++;result.salaryRejected++;}}
+          else if(x.year===priorYear&&x.month&&x.gross){uniquePush(state.priorSalaryRecords,{year:priorYear,month:x.month,gross:x.taxableGross,taxableGross:x.taxableGross,grossTotal:x.grossTotal,nonTaxableTotal:x.nonTaxableTotal,components:x.components||[],source:'google-drive',status:'prior',document:f.name,driveFileId:f.id,needsReview:x.needsReview},v=>`${v.year}-${v.month}-${v.document}`);if(x.social!=null)uniquePush(state.priorSocialRecords,{year:priorYear,month:x.month,amount:x.social,components:x.socialComponents||{},source:'google-drive',status:'prior',document:f.name,driveFileId:f.id},v=>`${v.year}-${v.month}-${v.document}`);result.added++}else {
+            state.sourceDocuments=state.sourceDocuments||[];
+            const old=state.sourceDocuments.find(d=>d.driveFileId===f.id||d.file===f.name);
+            const failedDoc={file:f.name,type:'salary_slip',status:'review_needed',source:'google-drive',driveFileId:f.id,year:x.year||null,month:x.month||null,taxableGross:x.taxableGross||null,grossTotal:x.grossTotal||null,nonTaxableTotal:x.nonTaxableTotal||null,social:x.social||null,needsReview:true,unknownComponents:x.unknownComponents||[],note:`給与明細は取得済みですが給与実績に登録できませんでした。課税対象額=${x.taxableGross??'取得失敗'}／年月=${x.year??'不明'}-${x.month??'不明'}。`};
+            if(old)Object.assign(old,failedDoc); else state.sourceDocuments.push(failedDoc);
+            result.review++; if(f.candidateType==='salary'){result.salaryReview++;result.salaryRejected++;}
+          }
         }else if(type==='bonus_slip'){
           const x=parseBonusPdf(pdf,f.name); if(![targetYear,priorYear].includes(Number(x.year))){result.skipped++;continue}
           if(!upsertBonusRecord(state,x,f,targetYear,result) && x.year===priorYear && x.date&&x.amount){state.priorBonusRecords=state.priorBonusRecords||[];uniquePush(state.priorBonusRecords,{year:priorYear,date:x.date,month:x.month,amount:x.amount,social:x.social,socialComponents:x.socialComponents||{},standardBonusHealth:x.standardBonusHealth,standardBonusPension:x.standardBonusPension,source:'prior',status:'prior',document:f.name,driveFileId:f.id},v=>`${v.date}-${v.document}`);result.added++;}else if(!(x.date&&x.amount))result.review++;
@@ -381,7 +411,7 @@ const FurusatoGoogleDrive = (() => {
         }else result.skipped++;
       }catch(e){result.errors.push(`${f.name}: ${e.message}`)}
     }
-    rebuildPriorSummary(state,priorYear); buildForecastFromPrior(state,targetYear,Number(state.actualThrough||9)); state.importDiagnostics={at:new Date().toISOString(),targetYear,files:result.files,salaryCandidates:result.salaryCandidates,salaryImported:result.salaryImported,salaryParsed:result.salaryParsed,salaryRejected:result.salaryRejected,errors:result.errors.slice()}; state.importSettings={...(state.importSettings||{}),targetYear,priorYear};
+    rebuildPriorSummary(state,priorYear); buildForecastFromPrior(state,targetYear,Number(state.actualThrough||9)); state.importDiagnostics={at:new Date().toISOString(),targetYear,files:result.files,salaryCandidates:result.salaryCandidates,salaryImported:result.salaryImported,salaryParsed:result.salaryParsed,salaryRejected:result.salaryRejected,salaryReview:result.salaryReview,errors:result.errors.slice(),candidates:result.candidates}; state.importSettings={...(state.importSettings||{}),targetYear,priorYear};
     return result;
   }
   return {CLIENT_KEY,getClientId,setClientId,ready,authorize,signOut,listCandidateFiles,scanAndImport,classifyPdfText,parseSalaryPdf,parseBonusPdf,parseWithholdingPdf,extractLabeledNumber,upsertSalaryRecord,upsertBonusRecord};
