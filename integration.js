@@ -45,7 +45,26 @@ const FurusatoGoogleDrive = (() => {
   }
   async function authorize(){await ready();return new Promise((resolve,reject)=>{tokenClient.callback=(resp)=>{if(resp?.error){reject(new Error(resp.error));return}accessToken=resp.access_token;gapi.client.setToken({access_token:accessToken});resolve(accessToken)};tokenClient.requestAccessToken({prompt:accessToken?'':'consent'})})}
   function signOut(){if(accessToken&&window.google?.accounts?.oauth2)google.accounts.oauth2.revoke(accessToken,()=>{});accessToken=null;try{gapi.client.setToken(null)}catch{} }
-  async function listCandidateFiles(){if(!accessToken)await authorize();const q="trashed = false and mimeType = 'application/pdf'";const r=await gapi.client.drive.files.list({q,orderBy:'modifiedTime desc',pageSize:100,fields:'files(id,name,mimeType,size,modifiedTime,createdTime,webViewLink,parents)'});const files=r.result.files||[];const key=/給与|給料|賃金|賞与|ボーナス|源泉徴収|年末調整|給与所得|chinginmeisai|gensen|salary|bonus|withholding/i;return files.map(f=>({...f,candidate:key.test(f.name)})).filter(f=>f.candidate)}
+  async function listCandidateFiles(){
+    if(!accessToken)await authorize();
+    const q="trashed = false and mimeType = 'application/pdf'";
+    const key=/給与|給料|賃金|給与明細|給与所得|給与支払|賃金明細|賞与|ボーナス|源泉|源泉徴収|年末調整|chinginmeisai|chingin|salary|bonus|gensen|withholding/i;
+    const files=[]; let pageToken='';
+    do{
+      const params={q,orderBy:'modifiedTime desc',pageSize:100,fields:'nextPageToken,files(id,name,mimeType,size,modifiedTime,createdTime,webViewLink,parents)'};
+      if(pageToken)params.pageToken=pageToken;
+      const r=await gapi.client.drive.files.list(params);
+      for(const f of (r.result.files||[])){
+        if(key.test(f.name||'')){
+          const n=f.name||'';
+          const candidateType=/bonus|賞与|ボーナス/i.test(n)?'bonus':/gensen|源泉|withholding/i.test(n)?'withholding':/chinginmeisai|chingin|給与|給料|賃金|salary/i.test(n)?'salary':'unknown';
+          files.push({...f,candidate:true,candidateType});
+        }
+      }
+      pageToken=r.result.nextPageToken||'';
+    }while(pageToken);
+    return files;
+  }
   async function downloadPdf(fileId){if(!accessToken)await authorize();const r=await fetch(`https://www.googleapis.com/drive/v3/files/${encodeURIComponent(fileId)}?alt=media`,{headers:{Authorization:`Bearer ${accessToken}`}});if(!r.ok)throw new Error(`Drive download failed: ${r.status}`);return await r.arrayBuffer()}
   async function pdfText(arrayBuffer){if(!window.pdfjsLib)await loadScript('https://cdnjs.cloudflare.com/ajax/libs/pdf.js/3.11.174/pdf.min.js');const pdf=window.pdfjsLib||window.pdfjs; if(!pdf)throw new Error('PDF解析ライブラリを読み込めませんでした'); if(pdf.GlobalWorkerOptions)pdf.GlobalWorkerOptions.workerSrc='https://cdnjs.cloudflare.com/ajax/libs/pdf.js/3.11.174/pdf.worker.min.js';const doc=await pdf.getDocument({data:arrayBuffer}).promise;let text='';for(let i=1;i<=doc.numPages;i++){const page=await doc.getPage(i);const c=await page.getTextContent();text+=c.items.map(x=>x.str).join(' ')+'\n'}return text}
   function classifyPdfText(text,name=''){
@@ -57,6 +76,8 @@ const FurusatoGoogleDrive = (() => {
     let m=s.match(/(20\d{2})年\s*(\d{1,2})月/);
     if(m)return {year:Number(m[1]),month:Number(m[2])};
     m=s.match(/(20\d{2})[/-](\d{1,2})(?:[/-]\d{1,2})?/);
+    if(m)return {year:Number(m[1]),month:Number(m[2])};
+    m=s.match(/(20\d{2})(0[1-9]|1[0-2])(?!\d)/);
     if(m)return {year:Number(m[1]),month:Number(m[2])};
     return {year:null,month:null};
   }

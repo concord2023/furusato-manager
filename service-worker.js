@@ -1,4 +1,4 @@
-const CACHE='furusato-manager-2026-09-19';
+const CACHE='furusato-manager-2026-09-19-2';
 const ASSETS=['./','./index.html','./details.html','./donations.html','./settings.html','./style.css','./app.js','./calculator.js','./data-model.js','./integration.js','./manifest.json'];
 self.addEventListener('install',e=>e.waitUntil(caches.open(CACHE).then(c=>c.addAll(ASSETS))));
 self.addEventListener('activate',e=>e.waitUntil(caches.keys().then(keys=>Promise.all(keys.filter(k=>k!==CACHE).map(k=>caches.delete(k))))));
