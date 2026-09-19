@@ -49,7 +49,7 @@ const FurusatoModel = (() => {
       s.forecastBonus=0;
       s.bonusSocialRecords=clone(DEFAULT.bonusSocialRecords);
     }
-    s.schemaVersion=7;
+    s.schemaVersion=8;
     s.importSettings=s.importSettings||{targetYear:s.year||2026,priorYear:(s.year||2026)-1};
     s.importSettings.targetYear=Number(s.importSettings.targetYear)||Number(s.year)||2026;
     s.importSettings.priorYear=s.importSettings.targetYear-1;
@@ -61,6 +61,7 @@ const FurusatoModel = (() => {
   }
   const IMPORT_HISTORY_KEY='furusatoImportHistory';
   const STATE_BACKUP_KEY='furusatoStateBackup';
+  const PAYROLL_STORE_KEY='furusatoPayrollStore';
   function safeRead(key){try{return localStorage.getItem(key)}catch{return null}}
   function safeWrite(key,value){try{localStorage.setItem(key,value);return true}catch{return false}}
   function load(){
@@ -71,6 +72,20 @@ const FurusatoModel = (() => {
       if(primary){try{raw=JSON.parse(primary)}catch{raw=null}}
       if(!raw&&backup){try{raw=JSON.parse(backup)}catch{raw=null}}
       const s=normalize(raw);
+      const storeRaw=safeRead(PAYROLL_STORE_KEY);
+      if(storeRaw){
+        try{
+          const store=JSON.parse(storeRaw);
+          if(store&&typeof store==='object'){
+            // The main state is authoritative. The payroll store is a recovery
+            // copy, not a second source that may overwrite newer data with an
+            // older/empty snapshot when navigating between pages.
+            for(const k of ['salaryRecords','socialRecords','forecastSalary','forecastSocial','bonusRecords','bonusSocialRecords','forecastBonus','priorSalaryRecords','priorSocialRecords','priorBonusRecords','prior','sourceDocuments','importScanCandidates','importDiagnostics','importSettings']){
+              if((s[k]===undefined || (Array.isArray(s[k])&&s[k].length===0)) && store[k]!==undefined)s[k]=clone(store[k]);
+            }
+          }
+        }catch{}
+      }
       const hRaw=safeRead(IMPORT_HISTORY_KEY);
       if(hRaw){try{const h=JSON.parse(hRaw);if(Array.isArray(h))s.importHistory=h.slice(0,200)}catch{}}
       return s;
@@ -85,9 +100,12 @@ const FurusatoModel = (() => {
     safeWrite(STATE_BACKUP_KEY,json);
     safeWrite('furusatoState',json);
     safeWrite(IMPORT_HISTORY_KEY,JSON.stringify(h));
+    const payrollStore={};
+    for(const k of ['salaryRecords','socialRecords','forecastSalary','forecastSocial','bonusRecords','bonusSocialRecords','forecastBonus','priorSalaryRecords','priorSocialRecords','priorBonusRecords','prior','sourceDocuments','importScanCandidates','importDiagnostics','importSettings'])payrollStore[k]=n[k];
+    safeWrite(PAYROLL_STORE_KEY,JSON.stringify(payrollStore));
     return n;
   }
-  return {DEFAULT,clone,merge,normalize,load,save};
+  return {DEFAULT,clone,merge,normalize,load,save,keys:{IMPORT_HISTORY_KEY,STATE_BACKUP_KEY,PAYROLL_STORE_KEY}};
 })();
 if(typeof window!=='undefined') window.FurusatoModel=FurusatoModel;
 if(typeof module!=='undefined') module.exports=FurusatoModel;

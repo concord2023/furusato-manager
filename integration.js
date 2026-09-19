@@ -113,35 +113,27 @@ const FurusatoGoogleDrive = (() => {
     if(!window.pdfjsLib)await loadScript('https://cdnjs.cloudflare.com/ajax/libs/pdf.js/3.11.174/pdf.min.js');
     const pdf=window.pdfjsLib||window.pdfjs;if(!pdf)throw new Error('PDF解析ライブラリを読み込めませんでした');
     if(pdf.GlobalWorkerOptions)pdf.GlobalWorkerOptions.workerSrc='https://cdnjs.cloudflare.com/ajax/libs/pdf.js/3.11.174/pdf.worker.min.js';
-    const doc=await pdf.getDocument({data:arrayBuffer,disableWorker:true}).promise; let text=''; const pages=[];
-    for(let i=1;i<=doc.numPages;i++){
-      const page=await doc.getPage(i); const c=await page.getTextContent();
-      const items=(c.items||[]).filter(x=>String(x.str||'').trim()).map(x=>({str:String(x.str||''),x:Number(x.transform?.[4]||0),y:Number(x.transform?.[5]||0),width:Number(x.width||0),height:Number(x.height||0)}));
-      pages.push(items); text+=items.map(x=>x.str).join(' ')+'\n';
-    }
-    return {text,pages,pageCount:doc.numPages,textItemCount:pages.reduce((a,p)=>a+p.length,0),ocrUsed:false};
+    // IMPORTANT: never let PDF.js own the caller's ArrayBuffer. Opening from a
+    // Blob URL also prevents PDF.js/worker transfer from detaching the bytes that
+    // the import pipeline may still need later.
+    const bytes=arrayBuffer instanceof ArrayBuffer?new Uint8Array(arrayBuffer.slice(0)):arrayBuffer;
+    const blob=new Blob([bytes],{type:'application/pdf'});
+    const url=URL.createObjectURL(blob);
+    try{
+      const doc=await pdf.getDocument({url,disableWorker:true}).promise;
+      let text=''; const pages=[];
+      for(let i=1;i<=doc.numPages;i++){
+        const page=await doc.getPage(i); const c=await page.getTextContent();
+        const items=(c.items||[]).filter(x=>String(x.str||'').trim()).map(x=>({str:String(x.str||''),x:Number(x.transform?.[4]||0),y:Number(x.transform?.[5]||0),width:Number(x.width||0),height:Number(x.height||0)}));
+        pages.push(items); text+=items.map(x=>x.str).join(' ')+'\n';
+      }
+      return {text,pages,pageCount:doc.numPages,textItemCount:pages.reduce((a,p)=>a+p.length,0),ocrUsed:false,pdfDoc:doc};
+    }finally{URL.revokeObjectURL(url)}
   }
-  let ocrWorkerPromise=null;
-  async function getOcrWorker(){
-    if(ocrWorkerPromise)return ocrWorkerPromise;
-    ocrWorkerPromise=(async()=>{
-      if(!window.Tesseract)await loadScript('https://cdn.jsdelivr.net/npm/tesseract.js@5/dist/tesseract.min.js');
-      if(!window.Tesseract?.createWorker)throw new Error('OCRライブラリを読み込めませんでした');
-      const worker=await window.Tesseract.createWorker('jpn+eng',1,{
-        workerPath:'https://cdn.jsdelivr.net/npm/tesseract.js@5/dist/worker.min.js',
-        langPath:'https://tessdata.projectnaptha.com/4.0.0'
-      });
-      if(worker.setParameters)await worker.setParameters({tessedit_pageseg_mode:'12',preserve_interword_spaces:'1'});
-      return worker;
-    })().catch(e=>{ocrWorkerPromise=null;throw e});
-    return ocrWorkerPromise;
-  }
-  async function ocrPdfFirstPage(arrayBuffer,region=null){
-    if(!window.pdfjsLib)await loadScript('https://cdnjs.cloudflare.com/ajax/libs/pdf.js/3.11.174/pdf.min.js');
-    const pdf=window.pdfjsLib||window.pdfjs;if(!pdf)throw new Error('PDF解析ライブラリを読み込めませんでした');
-    const doc=await pdf.getDocument({data:arrayBuffer,disableWorker:true}).promise;
+  async function ocrPageFromPdfDoc(doc,region=null){
+    if(!doc)throw new Error('OCR用PDFドキュメントがありません');
     const page=await doc.getPage(1);
-    const full=page.getViewport({scale:Number(region?.scale)||1.8});
+    const full=page.getViewport({scale:Number(region?.scale)||2.2});
     const r=region||{x0:0,y0:0,x1:1,y1:1};
     const sx=Math.max(0,Math.min(1,Number(r.x0)||0)),sy=Math.max(0,Math.min(1,Number(r.y0)||0));
     const ex=Math.max(sx,Math.min(1,Number(r.x1)==null?1:Number(r.x1))),ey=Math.max(sy,Math.min(1,Number(r.y1)==null?1:Number(r.y1)));
@@ -149,44 +141,45 @@ const FurusatoGoogleDrive = (() => {
     const cw=Math.max(1,Math.round(full.width*(ex-sx))),ch=Math.max(1,Math.round(full.height*(ey-sy)));
     canvas.width=cw;canvas.height=ch;
     const ctx=canvas.getContext('2d',{willReadFrequently:true});
-    // Render the requested page region directly. This is substantially faster
-    // than OCRing the whole payroll page, and the taxable amount is always in
-    // the lower-left summary block of this Toyota payroll layout.
     const transform=[1,0,0,1,-full.width*sx,-full.height*sy];
     await page.render({canvasContext:ctx,viewport:full,transform}).promise;
-    const worker=await getOcrWorker();
-    const rOcr=await worker.recognize(canvas);
+    if(!window.Tesseract)await loadScript('https://cdn.jsdelivr.net/npm/tesseract.js@5/dist/tesseract.min.js');
+    if(!window.Tesseract?.recognize)throw new Error('OCRライブラリを読み込めませんでした');
+    // Use the one-shot API. This avoids reusing a worker-backed buffer between
+    // recognitions, which was the source of "Buffer is already detached" on iOS.
+    const rOcr=await window.Tesseract.recognize(canvas,'jpn+eng',{tessedit_pageseg_mode:'12',preserve_interword_spaces:'1'});
     return {text:String(rOcr?.data?.text||''),pages:[],pageCount:doc.numPages,textItemCount:0,ocrUsed:true,ocrConfidence:Number(rOcr?.data?.confidence||0)};
   }
   async function ensurePdfText(arrayBuffer,pdf,name){
     const base=pdf||await pdfText(arrayBuffer);
     const type=candidateTypeFromName(name);
     if(type!=='salary')return base;
-    // Do not decide whether OCR is needed merely from a label search. Toyota's
-    // PDF can expose 「支給合計」 as text while the important 「課税対象額」
-    // value is in an image/table layer. Test the actual parser first.
     const first=parseSalaryComponents(base);
+    // If the text/layout parser can already recover the tax base, do NOT invoke
+    // OCR at all. Salary import must not fail merely because OCR is unavailable.
     const needsTaxOcr=first.taxableGross==null;
     const needsSocialOcr=first.socialTotal==null;
     if(!needsTaxOcr&&!needsSocialOcr)return base;
+    // First try a deterministic arithmetic recovery from the payroll totals.
+    // Toyota's slip explicitly prints Total Payment and Non-taxable Amount.
+    const derived=(first.grossTotal!=null&&first.nonTaxableTotal!=null&&first.grossTotal>=first.nonTaxableTotal)?first.grossTotal-first.nonTaxableTotal:null;
+    if(needsTaxOcr&&derived!=null){
+      return {...base,taxableGrossRecovered:derived};
+    }
     try{
-      // First OCR only the lower-left tax summary. This is the exact area where
-      // the screenshots show 「課税対象額 / Taxable Amount」, so it is fast and
-      // avoids the recognition errors caused by the dense work-record table.
-      let ocr=await ocrPdfFirstPage(arrayBuffer,{x0:0,y0:0.84,x1:0.50,y1:0.995,scale:2.5});
+      let ocr=await ocrPageFromPdfDoc(base.pdfDoc,{x0:0,y0:0.80,x1:0.62,y1:1,scale:2.8});
       let second=parseSalaryComponents(ocr);
       if(needsTaxOcr&&second.taxableGross==null){
-        // Last-resort fallback: OCR the whole first page once.
-        ocr=await ocrPdfFirstPage(arrayBuffer,null);
+        ocr=await ocrPageFromPdfDoc(base.pdfDoc,null);
         second=parseSalaryComponents(ocr);
       }
-      // Keep the original PDF.js layout for fields it could read, and use OCR
-      // text only as a fallback for missing fields.
       const merged={...base,ocrUsed:true,ocrConfidence:ocr.ocrConfidence||0,ocrText:ocr.text||'',ocrMissingBefore:{taxable:needsTaxOcr,social:needsSocialOcr}};
       if(needsTaxOcr&&second.taxableGross!=null)merged.ocrRecoveredTaxable=true;
       if(needsSocialOcr&&second.socialTotal!=null)merged.ocrRecoveredSocial=true;
       return merged;
     }catch(e){
+      // OCR is an optional fallback. Never turn a readable payroll PDF into a
+      // failed salary import because an iOS OCR runtime is unavailable.
       return {...base,ocrUsed:true,ocrError:e?.message||String(e)};
     }
   }
@@ -284,7 +277,7 @@ const FurusatoGoogleDrive = (() => {
               let acc='';
               for(let j=i;j<Math.min(items.length,i+12);j++){
                 acc+=items[j].str;
-                if(normalizeLabel(acc).includes(label)){
+                if(matchesLabel(acc,label)){
                   hits.push({x:items[j].x+items[j].width,y:line.y});
                   break;
                 }
@@ -328,6 +321,7 @@ const FurusatoGoogleDrive = (() => {
   }
   function extractToyotaPayrollAmount(textOrPdf, labels){
     const wanted=(labels||[]).map(normalizeLabel).filter(Boolean);
+    const matchesLabel=(acc,label)=>{const a=normalizeLabel(acc);if(label==='taxableamount'&&a.includes('nontaxableamount'))return false;return a.includes(label)};
     const layout=textOrPdf?.pages;
     const text=typeof textOrPdf==='string'?textOrPdf:(textOrPdf?.text||'');
     const toAmount=(s)=>{
@@ -364,7 +358,7 @@ const FurusatoGoogleDrive = (() => {
             let acc='';
             for(let j=i;j<Math.min(ordered.length,i+20);j++){
               acc+=ordered[j].str;
-              if(normalizeLabel(acc).includes(label)){
+              if(matchesLabel(acc,label)){
                 hits.push({x:ordered[j].x+ordered[j].width,y:line.y});
                 break;
               }
@@ -397,6 +391,7 @@ const FurusatoGoogleDrive = (() => {
       while(true){
         const idx=compact.indexOf(label,from);
         if(idx<0)break;
+        if(label==='taxableamount' && idx>=3 && compact.slice(Math.max(0,idx-3),idx)==='non'){from=idx+label.length;continue}
         const tail=compact.slice(idx+label.length,idx+label.length+24);
         const m=tail.match(/((?:\d{1,3}(?:,\d{3})+|\d{3,}))/);
         if(m){const n=Number(m[1].replace(/,/g,''));if(Number.isFinite(n)&&n>=100&&!(n>=1900&&n<=2100))return n;}
@@ -423,7 +418,12 @@ const FurusatoGoogleDrive = (() => {
     const socialKnown=Object.values(socialComponents).filter(v=>Number.isFinite(v));
     const socialTotal=socialKnown.length===Object.keys(socialComponents).length?socialKnown.reduce((a,v)=>a+v,0):null;
     const derivedTaxable=(grossTotal!=null&&nonTaxableTotal!=null&&grossTotal>=nonTaxableTotal)?grossTotal-nonTaxableTotal:null;
-    const taxableBase=taxableAmount!=null?taxableAmount:derivedTaxable;
+    // Toyota's slip explicitly gives Total Payment and the non-taxable portion.
+    // That arithmetic is more reliable than a text-layer match because the
+    // English phrase "Taxable Amount" can occur inside "Non-taxable Amount".
+    // When both totals are available, use the derived tax base and retain the
+    // label-derived value only as diagnostic information.
+    const taxableBase=derivedTaxable!=null?derivedTaxable:(taxableAmount!=null?taxableAmount:null);
     const grossComponents=[];
     const base=extractLabeledNumber(text,['基準賃金等','基本給']);
     const commuting=extractLabeledNumber(text,['通勤費補助','通勤手当']);
@@ -441,8 +441,14 @@ const FurusatoGoogleDrive = (() => {
   }
   function parseSalaryPdf(text,name){
     const raw=typeof text==='string'?text:(text?.text||'');
-    const d=mergeDateFallback(extractDateParts(raw,name),name);
+    // For monthly payroll, the filename is authoritative. The PDF body can
+    // contain cumulative phrases such as 2026年1月〜今回支払給与分, which
+    // must not turn every monthly slip into January.
+    const fd=filenameDateFallback(name);
+    const bodyDate=extractDateParts(raw,name);
+    const d={year:fd.year??bodyDate.year,month:fd.month??bodyDate.month};
     let c=parseSalaryComponents(text);
+    if(text&&typeof text==='object'&&text.taxableGrossRecovered!=null&&c.taxableGross==null)c={...c,taxableGross:Number(text.taxableGrossRecovered)};
     // If OCR was used only for the missing field, combine the best values from
     // the normal PDF parser and the OCR parser.
     if(text&&typeof text==='object'&&text.ocrText){
