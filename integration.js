@@ -141,7 +141,9 @@ const FurusatoGoogleDrive = (() => {
     const s=cleanPdfText(text);
     for(const label of labels){
       const esc=String(label).replace(/[.*+?^${}()|[\]\\]/g,'\\$&');
-      const re=new RegExp(esc+'(?:[^0-9]{0,100})([0-9][0-9,]{2,})','i');
+      // Prefer a number close to the label. PDF text extraction can reorder columns,
+      // so keep the search window short and try the original text plus a compact form.
+      const re=new RegExp(esc+'(?:[^0-9]{0,45})([0-9][0-9,]{2,})','i');
       const m=s.match(re); if(m)return Number(m[1].replace(/,/g,''));
     }
     return null;
@@ -180,8 +182,21 @@ const FurusatoGoogleDrive = (() => {
     return {grossTotal,taxableGross:taxableBase,nonTaxableTotal,socialComponents,socialTotal,grossComponents,unknownComponents:unknown,needsReview:taxableBase==null||socialTotal==null};
   }
   function parseSalaryPdf(text,name){
-    const d=extractDateParts(text,name),c=parseSalaryComponents(text);
-    return {year:d.year,month:d.month,gross:c.taxableGross,taxableGross:c.taxableGross,grossTotal:c.grossTotal,nonTaxableTotal:c.nonTaxableTotal,social:c.socialTotal,socialComponents:c.socialComponents,components:c.grossComponents,unknownComponents:c.unknownComponents,source:'google-drive',status:'actual',document:name,needsReview:c.needsReview};
+    const d=mergeDateFallback(extractDateParts(text,name),name),c=parseSalaryComponents(text);
+    const taxableGross=Number.isFinite(c.taxableGross)&&c.taxableGross>0?c.taxableGross:null;
+    const grossTotal=Number.isFinite(c.grossTotal)&&c.grossTotal>0?c.grossTotal:null;
+    return {year:d.year,month:d.month,gross:taxableGross,taxableGross,grossTotal,nonTaxableTotal:c.nonTaxableTotal,social:c.socialTotal,socialComponents:c.socialComponents,components:c.grossComponents,unknownComponents:c.unknownComponents,source:'google-drive',status:'actual',document:name,needsReview:taxableGross==null||c.socialTotal==null};
+  }
+  function filenameDateFallback(name){
+    const n=String(name||'');
+    let m=n.match(/(20\d{2})[-_](0[1-9]|1[0-2])(?:[-_]\d{1,2})?/);
+    if(m)return {year:Number(m[1]),month:Number(m[2])};
+    m=n.match(/(20\d{2})(0[1-9]|1[0-2])(?!\d)/);
+    return m?{year:Number(m[1]),month:Number(m[2])}:{year:null,month:null};
+  }
+  function mergeDateFallback(parsed,name){
+    const f=filenameDateFallback(name);
+    return {year:parsed.year??f.year,month:parsed.month??f.month};
   }
   function parseBonusPdf(text,name){
     const d=extractDateParts(text,name),s=cleanPdfText(text);
@@ -242,15 +257,15 @@ const FurusatoGoogleDrive = (() => {
   async function scanAndImport(state,onProgress){
     const targetYear=Number(state.importSettings?.targetYear||state.year||new Date().getFullYear()); const priorYear=targetYear-1; state.year=targetYear;
     const files=await listCandidateFiles(targetYear);
-    const result={files:files.length,added:0,review:0,skipped:0,errors:[],candidates:files.map(f=>({name:f.name,type:f.candidateType,year:f.filenameYear}))};
+    const result={files:files.length,added:0,review:0,skipped:0,errors:[],salaryCandidates:files.filter(f=>f.candidateType==='salary').length,salaryImported:0,salaryReview:0,candidates:files.map(f=>({name:f.name,type:f.candidateType,year:f.filenameYear}))};
     state.priorSalaryRecords=(state.priorSalaryRecords||[]).filter(x=>Number(x.year)===priorYear); state.priorBonusRecords=(state.priorBonusRecords||[]).filter(x=>Number(x.year)===priorYear); state.priorSocialRecords=(state.priorSocialRecords||[]).filter(x=>Number(x.year)===priorYear);
     for(const f of files){
       try{
-        onProgress?.(`解析中: ${f.name}`); const buf=await downloadPdf(f.id),text=await pdfText(buf),type=classifyPdfText(text,f.name);
+        onProgress?.(`解析中: ${f.name}`); const buf=await downloadPdf(f.id),text=await pdfText(buf),detectedType=classifyPdfText(text,f.name),type=detectedType==='unknown' ? ({salary:'salary_slip',bonus:'bonus_slip',withholding:'withholding'}[f.candidateType]||detectedType) : detectedType;
         if(type==='salary_slip'){
           const x=parseSalaryPdf(text,f.name); if(![targetYear,priorYear].includes(Number(x.year))){result.skipped++;continue}
-          if(x.year===targetYear&&x.month&&x.gross){state.salaryRecords=state.salaryRecords||[];const same=state.salaryRecords.find(r=>Number(r.month)===x.month&&r.document===f.name);if(!same){state.salaryRecords=state.salaryRecords.filter(r=>Number(r.month)!==x.month||r.source==='manual');state.salaryRecords.push({year:targetYear,month:x.month,gross:x.taxableGross, taxableGross:x.taxableGross, grossTotal:x.grossTotal, nonTaxableTotal:x.nonTaxableTotal, components:x.components||[], source:'google-drive',status:'actual',document:f.name,driveFileId:f.id,needsReview:x.needsReview});if(x.social!=null){state.socialRecords=state.socialRecords||[];state.socialRecords=state.socialRecords.filter(r=>Number(r.month)!==x.month||r.source==='manual');state.socialRecords.push({year:targetYear,month:x.month,amount:x.social,components:x.socialComponents||{},source:'google-drive',status:'actual',document:f.name,driveFileId:f.id,needsReview:false})}if(x.needsReview)result.review++;result.added++}}
-          else if(x.year===priorYear&&x.month&&x.gross){uniquePush(state.priorSalaryRecords,{year:priorYear,month:x.month,gross:x.taxableGross,taxableGross:x.taxableGross,grossTotal:x.grossTotal,nonTaxableTotal:x.nonTaxableTotal,components:x.components||[],source:'google-drive',status:'prior',document:f.name,driveFileId:f.id,needsReview:x.needsReview},v=>`${v.year}-${v.month}-${v.document}`);if(x.social!=null)uniquePush(state.priorSocialRecords,{year:priorYear,month:x.month,amount:x.social,components:x.socialComponents||{},source:'google-drive',status:'prior',document:f.name,driveFileId:f.id},v=>`${v.year}-${v.month}-${v.document}`);result.added++}else result.review++;
+          if(x.year===targetYear&&x.month&&Number(x.taxableGross)>0){state.salaryRecords=state.salaryRecords||[];const same=state.salaryRecords.find(r=>Number(r.month)===x.month&&r.document===f.name);if(!same){state.salaryRecords=state.salaryRecords.filter(r=>Number(r.month)!==x.month||r.source==='manual');state.salaryRecords.push({year:targetYear,month:x.month,gross:x.taxableGross, taxableGross:x.taxableGross, grossTotal:x.grossTotal, nonTaxableTotal:x.nonTaxableTotal, components:x.components||[], source:'google-drive',status:'actual',document:f.name,driveFileId:f.id,needsReview:x.needsReview});if(x.social!=null){state.socialRecords=state.socialRecords||[];state.socialRecords=state.socialRecords.filter(r=>Number(r.month)!==x.month||r.source==='manual');state.socialRecords.push({year:targetYear,month:x.month,amount:x.social,components:x.socialComponents||{},source:'google-drive',status:'actual',document:f.name,driveFileId:f.id,needsReview:false})}if(x.needsReview){result.review++;result.salaryReview++}result.added++;result.salaryImported++}}
+          else if(x.year===priorYear&&x.month&&x.gross){uniquePush(state.priorSalaryRecords,{year:priorYear,month:x.month,gross:x.taxableGross,taxableGross:x.taxableGross,grossTotal:x.grossTotal,nonTaxableTotal:x.nonTaxableTotal,components:x.components||[],source:'google-drive',status:'prior',document:f.name,driveFileId:f.id,needsReview:x.needsReview},v=>`${v.year}-${v.month}-${v.document}`);if(x.social!=null)uniquePush(state.priorSocialRecords,{year:priorYear,month:x.month,amount:x.social,components:x.socialComponents||{},source:'google-drive',status:'prior',document:f.name,driveFileId:f.id},v=>`${v.year}-${v.month}-${v.document}`);result.added++}else {result.review++; if(f.candidateType==='salary') result.salaryReview++;}
         }else if(type==='bonus_slip'){
           const x=parseBonusPdf(text,f.name); if(![targetYear,priorYear].includes(Number(x.year))){result.skipped++;continue}
           if(x.date&&x.amount){if(x.year===targetYear){state.bonusRecords=state.bonusRecords||[];const existing=state.bonusRecords.some(r=>r.document===f.name||Number(r.amount)===Number(x.amount)&&r.date===x.date);if(!existing){state.bonusRecords.push({...x,driveFileId:f.id});if(x.social!=null){state.bonusSocialRecords=state.bonusSocialRecords||[];state.bonusSocialRecords=state.bonusSocialRecords.filter(r=>r.date!==x.date||r.source==='manual');state.bonusSocialRecords.push({date:x.date,month:x.month,amount:x.social,components:x.socialComponents||{},standardBonusHealth:x.standardBonusHealth,standardBonusPension:x.standardBonusPension,source:'google-drive',status:'actual',document:f.name,driveFileId:f.id,needsReview:false})}result.added++}}else{state.priorBonusRecords=state.priorBonusRecords||[];uniquePush(state.priorBonusRecords,{year:priorYear,date:x.date,month:x.month,amount:x.amount,social:x.social,socialComponents:x.socialComponents||{},standardBonusHealth:x.standardBonusHealth,standardBonusPension:x.standardBonusPension,source:'google-drive',status:'prior',document:f.name,driveFileId:f.id},v=>`${v.date}-${v.document}`);result.added++}}else result.review++;

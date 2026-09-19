@@ -1,7 +1,7 @@
 // Data model and normalization for the ふるさと納税マネージャー.
 const FurusatoModel = (() => {
   const DEFAULT = {
-    schemaVersion: 4, year: 2026, asOf: '2026-09-17', actualThrough: 9, importSettings:{targetYear:2026,priorYear:2025},
+    schemaVersion: 5, year: 2026, asOf: '2026-09-17', actualThrough: 9, importSettings:{targetYear:2026,priorYear:2025},
     salaryRecords: [],
     forecastSalary: [],
     forecastMethod:{salary:'2026年4〜9月実績平均',social:'2026年4〜9月実績平均',bonus:'対象年の未支給シーズンは前年同シーズン賞与を参考'},
