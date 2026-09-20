@@ -55,7 +55,18 @@ const FurusatoModel = (() => {
     s.importSettings=s.importSettings||{targetYear:s.year||2026,priorYear:(s.year||2026)-1};
     s.importSettings.targetYear=Number(s.importSettings.targetYear)||Number(s.year)||2026;
     s.importSettings.priorYear=s.importSettings.targetYear-1;
-    s.salaryRecords=(s.salaryRecords||[]).map(r=>({...r,taxableGross:r.taxableGross==null?Number(r.gross)||0:Number(r.taxableGross)})).filter(r=>Number(r.taxableGross)>0 || r.source==='manual');
+    s.salaryRecords=(s.salaryRecords||[])
+      .map(r=>({...r,taxableGross:r.taxableGross==null?Number(r.gross)||0:Number(r.taxableGross)}))
+      .filter(r=>Number(r.taxableGross)>0 || r.source==='manual');
+    // Old builds could leave auto-generated/demo payroll rows in localStorage.
+    // A payroll row imported from Drive has a document/file id; manual rows are kept.
+    // Never let a legacy auto row masquerade as a newly imported actual month.
+    s.salaryRecords=s.salaryRecords.filter(r=>!(r.source==='auto' && !r.document && !r.driveFileId && !r.fileId));
+    s.socialRecords=(s.socialRecords||[]).filter(r=>!(r.source==='auto' && !r.document && !r.driveFileId && !r.fileId));
+    // Recompute the actual-through marker from actual salary records instead of trusting
+    // stale metadata such as the old fixed "through September" default.
+    const actualMonths=s.salaryRecords.filter(r=>r.status==='actual' && Number(r.month)>=1 && Number(r.month)<=12 && Number(r.taxableGross)>0).map(r=>Number(r.month));
+    s.actualThrough=actualMonths.length?Math.max(...actualMonths):0;
     s.taxableAdjustments=Array.isArray(s.taxableAdjustments)?s.taxableAdjustments:[];
     s.deductions=s.deductions||{};
     if(!s.deductions.lifeInsurance)s.deductions.lifeInsurance={newGeneral:0,oldGeneral:0,nursingMedical:0,newPension:0,oldPension:0,source:'manual',needsConfirmation:false};
@@ -67,7 +78,12 @@ const FurusatoModel = (() => {
     s.family.dependents=Array.isArray(s.family.dependents)?s.family.dependents:[];
     s.priorWithholding=s.priorWithholding||null; s.currentWithholding=s.currentWithholding||null;
     s.bonusSocialRecords=Array.isArray(s.bonusSocialRecords)?s.bonusSocialRecords:[];
-    if(!s.salaryRecords?.length && Array.isArray(raw?.salary)) s.salaryRecords=raw.salary.map((gross,i)=>({month:i+1,gross,source:'auto',status:i+1<=9?'actual':'forecast'}));
+    if(!s.salaryRecords?.length && Array.isArray(raw?.salary)){
+      const legacyThrough=Number(raw?.actualThrough);
+      s.salaryRecords=raw.salary.map((gross,i)=>({month:i+1,gross,source:'legacy',status:(legacyThrough>0?i+1<=legacyThrough:true)?'actual':'forecast'})).filter(r=>Number(r.gross)>0);
+      const legacyActual=s.salaryRecords.filter(r=>r.status==='actual').map(r=>r.month);
+      s.actualThrough=legacyActual.length?Math.max(...legacyActual):0;
+    }
     return s;
   }
   const IMPORT_HISTORY_KEY='furusatoImportHistory';
