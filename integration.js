@@ -830,7 +830,15 @@ const FurusatoGoogleDrive = (() => {
     }
     return null;
   }
-  function bonusSeason(month){const m=Number(month)||0;if(m>=5&&m<=9)return 'summer';if(m>=10&&m<=12)return 'winter';if(m>=1&&m<=2)return 'winter';return '';}
+  function bonusSeason(month){
+    const m=Number(month)||0;
+    // Toyotaの年2回賞与を前提に、夏（5〜9月）・冬（10〜2月）の2枠で管理。
+    // 代表月は夏=6月、冬=12月だが、支給月そのものはPDFから保持する。
+    if(m>=5&&m<=9)return 'summer';
+    if(m>=10&&m<=12)return 'winter';
+    if(m>=1&&m<=2)return 'winter';
+    return '';
+  }
   function parseBonusPdf(text,name){
     const raw=typeof text==='string'?text:(text?.text||''); const d=extractDateParts(raw,name);
     let amount=extractExactYenAfterLabel(text,['支給合計（A)','支給合計(A)','支給総額','総支給額','賞与額','Bonus Amount','Total Payment']);
@@ -1018,7 +1026,9 @@ const FurusatoGoogleDrive = (() => {
     };
   }
   function upsertSalaryRecord(state,x,f,targetYear,result){
-    if(!(x.year===targetYear&&x.month&&Number(x.taxableGross)>0&&!x.needsReview))return false;
+    // 登録の必須条件は「対象年・月・課税対象額」。
+    // OCRで控除内訳などが欠けても、課税対象額まで読めていれば給与本体は登録する。
+    if(!(Number(x.year)===Number(targetYear)&&Number(x.month)>=1&&Number(x.month)<=12&&Number(x.taxableGross)>0))return false;
     result.salaryParsed++; state.salaryRecords=state.salaryRecords||[];
     state.salaryRecords=state.salaryRecords.filter(r=>Number(r.month)!==x.month||r.source==='manual');
     state.salaryRecords.push({year:targetYear,month:x.month,gross:x.taxableGross,taxableGross:x.taxableGross,grossTotal:x.grossTotal,nonTaxableTotal:x.nonTaxableTotal,components:x.components||[],source:'google-drive',status:'actual',document:f.name,driveFileId:f.id,needsReview:x.needsReview});
@@ -1026,7 +1036,9 @@ const FurusatoGoogleDrive = (() => {
     if(x.needsReview){result.review++;result.salaryReview++}result.added++;result.salaryImported++; return true;
   }
   function upsertBonusRecord(state,x,f,targetYear,result){
-    if(!(x.date&&x.amount&&!x.needsReview&&x.season))return false;
+    // 賞与本体の必須条件は「対象年・支給日・総支給額・夏/冬」。
+    // 控除内訳や算術検証がOCRで欠けても、賞与本体は登録する。
+    if(!(x.date&&Number(x.amount)>0&&x.season))return false;
     if(Number(x.year)!==Number(targetYear))return false;
     state.bonusRecords=state.bonusRecords||[];
     const season=x.season||bonusSeason(x.month);
@@ -1060,13 +1072,13 @@ const FurusatoGoogleDrive = (() => {
       try{
         onProgress?.(`解析中: ${f.name}`); const buf=await downloadPdf(f.id); let pdf=await pdfText(buf); pdf=await ensurePdfText(buf,pdf,f.name); const text=pdf.text,detectedType=classifyPdfText(text,f.name),type=detectedType==='unknown' ? ({salary:'salary_slip',bonus:'bonus_slip',withholding:'withholding'}[f.candidateType]||detectedType) : detectedType; const detail={name:f.name,id:f.id,type:f.candidateType,filenameYear:f.filenameYear||null,detectedType:type,textChars:String(text||'').length,textItemCount:pdf.textItemCount||0,ocrUsed:!!pdf.ocrUsed,ocrConfidence:pdf.ocrConfidence||0,ocrError:pdf.ocrError||'',ocrWordCount:pdf.ocrWordCount||0,ocrValidated:!!pdf.ocrValidated,ocrAttempts:pdf.ocrAttempts||[],pageCount:pdf.pageCount||0,pageMeta:pdf.pageMeta||[],ocrWidth:pdf.ocrWidth||0,ocrHeight:pdf.ocrHeight||0,ocrImageBytes:pdf.imageBytes||0,ocrCornerNonWhite:pdf.cornerNonWhite||0,ocrCornerMean:pdf.cornerMean||0}; state.importFileDetails.push(detail);
         if(type==='salary_slip'){
-          const x=parseSalaryPdf(pdf,f.name); Object.assign(detail,{year:x.year||null,month:x.month||null,gross:x.gross||0,taxableGross:x.taxableGross||0,grossTotal:x.grossTotal||0,nonTaxableTotal:x.nonTaxableTotal||0,social:x.social||0,components:x.components||{},socialComponents:x.socialComponents||{},needsReview:!!x.needsReview}); x.ocrUsed=!!pdf.ocrUsed; if(x.ocrUsed)result.salaryOcr++; x.ocrConfidence=pdf.ocrConfidence||0; x.textItemCount=pdf.textItemCount||0; x.textChars=String(pdf.text||'').length; x.ocrError=pdf.ocrError||''; const inScope=[targetYear,priorYear].includes(Number(x.year));
+          const x=parseSalaryPdf(pdf,f.name); Object.assign(detail,{year:x.year||null,month:x.month||null,gross:x.gross||0,taxableGross:x.taxableGross||0,grossTotal:x.grossTotal||0,nonTaxableTotal:x.nonTaxableTotal||0,social:x.social||0,components:x.components||{},socialComponents:x.socialComponents||{},needsReview:!!x.needsReview,registrationCore:!!(x.year&&x.month&&Number(x.taxableGross)>0)}); x.ocrUsed=!!pdf.ocrUsed; if(x.ocrUsed)result.salaryOcr++; x.ocrConfidence=pdf.ocrConfidence||0; x.textItemCount=pdf.textItemCount||0; x.textChars=String(pdf.text||'').length; x.ocrError=pdf.ocrError||''; const inScope=[targetYear,priorYear].includes(Number(x.year));
           if(!inScope){result.skipped++; recordHistory(state,{at:new Date().toISOString(),name:f.name,type:'salary',year:x.year||f.filenameYear||null,status:'対象外',reason:'対象年/前年ではない'});continue}
           if(upsertSalaryRecord(state,x,f,targetYear,result)){
             recordHistory(state,{at:new Date().toISOString(),name:f.name,type:'salary',year:x.year,month:x.month,status:'取り込み済み',taxableGross:x.taxableGross,grossTotal:x.grossTotal,social:x.social,needsReview:!!x.needsReview,ocrUsed:!!x.ocrUsed,ocrConfidence:x.ocrConfidence||0,textChars:x.textChars||0,textItemCount:x.textItemCount||0,ocrWordCount:pdf.ocrWordCount||0,ocrValidated:!!pdf.ocrValidated,ocrError:x.ocrError||''});
           } else if(x.year===priorYear&&x.month&&x.gross){uniquePush(state.priorSalaryRecords,{year:priorYear,month:x.month,gross:x.taxableGross,taxableGross:x.taxableGross,grossTotal:x.grossTotal,nonTaxableTotal:x.nonTaxableTotal,components:x.components||[],source:'google-drive',status:'prior',document:f.name,driveFileId:f.id,needsReview:x.needsReview},v=>`${v.year}-${v.month}-${v.document}`);if(x.social!=null)uniquePush(state.priorSocialRecords,{year:priorYear,month:x.month,amount:x.social,components:x.socialComponents||{},source:'google-drive',status:'prior',document:f.name,driveFileId:f.id},v=>`${v.year}-${v.month}-${v.document}`);result.added++;recordHistory(state,{at:new Date().toISOString(),name:f.name,type:'salary',year:x.year,month:x.month,status:'前年保存',taxableGross:x.taxableGross,grossTotal:x.grossTotal,social:x.social,needsReview:!!x.needsReview,ocrUsed:!!x.ocrUsed,ocrConfidence:x.ocrConfidence||0,textChars:x.textChars||0,textItemCount:x.textItemCount||0,ocrWordCount:pdf.ocrWordCount||0,ocrValidated:!!pdf.ocrValidated,ocrError:x.ocrError||''});}else {result.review++; if(f.candidateType==='salary'){result.salaryReview++;result.salaryRejected++;}recordHistory(state,{at:new Date().toISOString(),name:f.name,type:'salary',year:x.year||f.filenameYear||null,month:x.month||null,status:'確認待ち',taxableGross:x.taxableGross,grossTotal:x.grossTotal,social:x.social,needsReview:true,reason:`給与登録できませんでした：課税対象額=${x.taxableGross==null?'取得失敗':x.taxableGross}／支給合計=${x.grossTotal==null?'取得失敗':x.grossTotal}／非課税=${x.nonTaxableTotal==null?'取得失敗':x.nonTaxableTotal}／年月=${x.year||f.filenameYear||'不明'}-${x.month||'不明'}／OCR=${x.ocrUsed?'実行':'未実行'}${x.ocrError?`／OCRエラー=${x.ocrError}`:''}／文字数=${x.textChars||0}／文字項目=${x.textItemCount||0}`});}
         }else if(type==='bonus_slip'){
-          const x=parseBonusPdf(pdf,f.name); Object.assign(detail,{year:x.year||null,month:x.month||null,date:x.date||null,amount:x.amount||0,social:x.social||0,socialComponents:x.socialComponents||{},needsReview:!!x.needsReview}); if(![targetYear,priorYear].includes(Number(x.year))){result.skipped++;continue}
+          const x=parseBonusPdf(pdf,f.name); Object.assign(detail,{year:x.year||null,month:x.month||null,date:x.date||null,amount:x.amount||0,social:x.social||0,socialComponents:x.socialComponents||{},needsReview:!!x.needsReview,registrationCore:!!(x.date&&Number(x.amount)>0&&x.season)}); if(![targetYear,priorYear].includes(Number(x.year))){result.skipped++;continue}
           if(!upsertBonusRecord(state,x,f,targetYear,result) && Number(x.year)===Number(priorYear) && x.date&&x.amount&&x.season){state.priorBonusRecords=state.priorBonusRecords||[];const season=x.season||bonusSeason(x.month);state.priorBonusRecords=state.priorBonusRecords.filter(v=>!(Number(v.year)===Number(priorYear)&&(v.season||bonusSeason(v.month))===season));state.priorBonusRecords.push({year:priorYear,date:x.date,month:x.month,season,amount:x.amount,social:x.social,socialComponents:x.socialComponents||{},standardBonusHealth:x.standardBonusHealth,standardBonusPension:x.standardBonusPension,source:'prior',status:'prior',document:f.name,driveFileId:f.id});result.added++;recordHistory(state,{at:new Date().toISOString(),name:f.name,type:'bonus',year:x.year||f.filenameYear||null,month:x.month||null,date:x.date||null,status:'取り込み済み',amount:x.amount||null,social:x.social||null,needsReview:false});}else if(!(x.date&&x.amount&&x.season)){result.review++;state.importHistory.unshift({at:new Date().toISOString(),name:f.name,type:'bonus',year:x.year||f.filenameYear||null,status:'確認待ち',amount:x.amount||null,social:x.social||null,needsReview:true,reason:x.date&&x.amount&&!x.season?'賞与月が夏（5〜9月）/冬（10〜2月）のどちらにも判定できませんでした':'賞与額または年月を取得できませんでした'});}
         }else if(type==='withholding'){
           const x=parseWithholdingPdf(pdf,f.name); Object.assign(detail,{year:x.year||null,annualSalary:x.annualSalary||0,salaryIncomeAfterDeduction:x.salaryIncomeAfterDeduction||0,deductionsTotal:x.deductionsTotal||0,social:x.social||0,incomeTax:x.incomeTax||0,lifeInsuranceDeduction:x.lifeInsuranceDeduction||0,earthquakeInsuranceDeduction:x.earthquakeInsuranceDeduction||0,housingLoanDeduction:x.housingLoanDeduction||0,specialDependent:x.specialDependent||0,basicDeduction:x.basicDeduction||0,incomeAdjustment:x.incomeAdjustment||0,newLifeInsurance:x.newLifeInsurance||0,oldLifeInsurance:x.oldLifeInsurance||0,nursingInsurance:x.nursingInsurance||0,newPension:x.newPension||0,oldPension:x.oldPension||0,needsReview:!!x.needsReview}); if(x.year&&![targetYear,priorYear].includes(Number(x.year))){result.skipped++;continue}

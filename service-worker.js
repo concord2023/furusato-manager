@@ -1,4 +1,4 @@
-const CACHE='furusato-manager-2026-09-20-fix6';
+const CACHE='furusato-manager-2026-09-20-fix7';
 const ASSETS=[
   './',
   './index.html',
