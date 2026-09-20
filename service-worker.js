@@ -1,4 +1,4 @@
-const CACHE='furusato-manager-2026-09-20-payroll-v12';
+const CACHE='furusato-manager-2026-09-20-payroll-v13';
 const ASSETS=['./','./index.html','./details.html','./donations.html','./settings.html','./style.css','./app.js','./calculator.js','./data-model.js','./integration.js','./manifest.json'];
 const isAppAsset=url=>url.origin===self.location.origin && /\.(?:html|js|css|json)$/.test(url.pathname);
 self.addEventListener('install',e=>e.waitUntil(caches.open(CACHE).then(c=>c.addAll(ASSETS)).then(()=>self.skipWaiting())));
