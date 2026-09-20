@@ -173,20 +173,29 @@ const FurusatoGoogleDrive = (() => {
     const ex=Math.max(sx,Math.min(1,Number(r.x1)==null?1:Number(r.x1))),ey=Math.max(sy,Math.min(1,Number(r.y1)==null?1:Number(r.y1)));
     const canvas=document.createElement('canvas'); const cw=Math.max(1,Math.round(full.width*(ex-sx))),ch=Math.max(1,Math.round(full.height*(ey-sy)));
     canvas.width=cw;canvas.height=ch; const ctx=canvas.getContext('2d',{willReadFrequently:true});
-    await page.render({canvasContext:ctx,viewport:full,transform:[1,0,0,1,-full.width*sx,-full.height*sy]}).promise;
+    // iOS/Safari guard: force an opaque white page before OCR. Transparent PDF canvas
+    // backgrounds can be serialized into PNG in a way that makes Tesseract see a blank page.
+    ctx.save(); ctx.globalCompositeOperation='source-over'; ctx.fillStyle='#ffffff'; ctx.fillRect(0,0,cw,ch); ctx.restore();
+    await page.render({canvasContext:ctx,viewport:full,background:'#ffffff',transform:[1,0,0,1,-full.width*sx,-full.height*sy]}).promise;
     if(!window.Tesseract)await loadScript('https://cdn.jsdelivr.net/npm/tesseract.js@5/dist/tesseract.min.js');
     if(!window.Tesseract?.recognize)throw new Error('OCRライブラリを読み込めませんでした');
     const psm=String(options.psm||11);
     const lang=String(options.lang||'jpn+eng');
     const sample=ctx.getImageData(0,0,Math.min(cw,64),Math.min(ch,64)).data;
     let nonWhite=0,sum=0; for(let i=0;i<sample.length;i+=4){const v=(sample[i]+sample[i+1]+sample[i+2])/3;sum+=v;if(v<245)nonWhite++;}
-    // iOS Safari can hand Tesseract a canvas that looks valid but is effectively
-    // unreadable to the worker. Passing an explicit PNG data URL is more stable.
+    // Inspect the rendered pixels across the image, not only the top-left corner.
+    const statW=Math.min(cw,160),statH=Math.min(ch,160);
+    const fullSample=ctx.getImageData(0,0,statW,statH).data;
+    let fullNonWhite=0,fullSum=0,fullMin=255,fullMax=0;
+    for(let i=0;i<fullSample.length;i+=4){const v=(fullSample[i]+fullSample[i+1]+fullSample[i+2])/3;fullSum+=v;fullMin=Math.min(fullMin,v);fullMax=Math.max(fullMax,v);if(v<245)fullNonWhite++;}
+    const fullPixels=fullSample.length/4;
+    // Passing an explicit opaque PNG data URL is more stable on iOS Safari.
     const imageDataUrl=canvas.toDataURL('image/png');
+    lastOcrImageDataUrl=imageDataUrl;
     const rOcr=await window.Tesseract.recognize(imageDataUrl,lang,{tessedit_pageseg_mode:psm,preserve_interword_spaces:'1'});
     const data=rOcr?.data||{};
-    const result={text:String(data.text||''),words:Array.isArray(data.words)?data.words:[],pages:[],pageCount:doc.numPages,textItemCount:0,ocrUsed:true,ocrConfidence:Number(data.confidence||0),ocrPsm:psm,ocrLang:lang,ocrWidth:cw,ocrHeight:ch,ocrRegion:!!region,imageBytes:imageDataUrl.length,cornerNonWhite:nonWhite,cornerMean:sample.length?sum/(sample.length/4):255};
-    diag({stage:'ocr',psm,lang,chars:result.text.length,words:result.words.length,confidence:result.ocrConfidence,width:cw,height:ch,imageBytes:result.imageBytes,cornerNonWhite:result.cornerNonWhite,cornerMean:result.cornerMean,region:!!region,sample:result.text.slice(0,300)});
+    const result={text:String(data.text||''),words:Array.isArray(data.words)?data.words:[],pages:[],pageCount:doc.numPages,textItemCount:0,ocrUsed:true,ocrConfidence:Number(data.confidence||0),ocrPsm:psm,ocrLang:lang,ocrWidth:cw,ocrHeight:ch,ocrRegion:!!region,imageBytes:imageDataUrl.length,cornerNonWhite:nonWhite,cornerMean:sample.length?sum/(sample.length/4):255,renderSampleWidth:statW,renderSampleHeight:statH,renderNonWhite:fullNonWhite,renderNonWhiteRatio:fullPixels?fullNonWhite/fullPixels:0,renderMean:fullPixels?fullSum/fullPixels:255,renderMin:fullMin,renderMax:fullMax};
+    diag({stage:'ocr',psm,lang,chars:result.text.length,words:result.words.length,confidence:result.ocrConfidence,width:cw,height:ch,imageBytes:result.imageBytes,cornerNonWhite:result.cornerNonWhite,cornerMean:result.cornerMean,renderSampleWidth:statW,renderSampleHeight:statH,renderNonWhite:fullNonWhite,renderNonWhiteRatio:result.renderNonWhiteRatio,renderMean:result.renderMean,renderMin:result.renderMin,renderMax:result.renderMax,region:!!region,sample:result.text.slice(0,300)});
     return result;
   }
   function ocrQuality(text,confidence=0){
@@ -212,17 +221,17 @@ const FurusatoGoogleDrive = (() => {
       // Keep both layouts. Sparse PSM 11 is good at Japanese labels, while PSM
       // 6 often preserves the numeric summary row. Choosing only one can lose
       // either the label or its value, so the parser receives their union.
-      attempts.push(await ocrPageFromPdfDoc(base.pdfDoc,null,{scale:3.0,psm:11,lang:'jpn+eng'}));
-      attempts.push(await ocrPageFromPdfDoc(base.pdfDoc,null,{scale:3.0,psm:6,lang:'jpn+eng'}));
+      attempts.push(await ocrPageFromPdfDoc(base.pdfDoc,null,{scale:2.5,psm:11,lang:'jpn'}));
+      attempts.push(await ocrPageFromPdfDoc(base.pdfDoc,null,{scale:2.5,psm:6,lang:'jpn'}));
       const firstText=attempts.map(x=>String(x.text||'')).join('\n');
       // Numeric fields on this payroll are often recognized more reliably by the
       // English model than by the mixed Japanese model. Use it only when the
       // first OCR pass is too sparse; this is a fallback, not the primary parser.
       if(ocrQuality(firstText,Math.max(...attempts.map(x=>Number(x.ocrConfidence||0))))<260){
-        attempts.push(await ocrPageFromPdfDoc(base.pdfDoc,null,{scale:3.0,psm:11,lang:'eng'}));
+        attempts.push(await ocrPageFromPdfDoc(base.pdfDoc,null,{scale:2.5,psm:11,lang:'eng'}));
       }
       if(type==='salary' && ocrQuality(attempts.map(x=>x.text).join('\n'),Math.max(...attempts.map(x=>x.ocrConfidence||0)))<260){
-        attempts.push(await ocrPageFromPdfDoc(base.pdfDoc,{x0:0,y0:0.68,x1:0.75,y1:1},{scale:3.2,psm:11,lang:'jpn+eng'}));
+        attempts.push(await ocrPageFromPdfDoc(base.pdfDoc,{x0:0,y0:0.68,x1:0.75,y1:1},{scale:2.5,psm:11,lang:'jpn'}));
       }
       const nonEmpty=attempts.filter(x=>String(x.text||'').trim().length>=20);
       if(!nonEmpty.length)throw new Error('OCR結果が空または短すぎます');
@@ -998,7 +1007,7 @@ const FurusatoGoogleDrive = (() => {
     rebuildPriorSummary(state,priorYear); buildForecastFromPrior(state,targetYear,Number(state.actualThrough||9)); state.importDiagnostics={at:new Date().toISOString(),targetYear,files:result.files,salaryCandidates:result.salaryCandidates,salaryImported:result.salaryImported,salaryParsed:result.salaryParsed,salaryOcr:result.salaryOcr,salaryRejected:result.salaryRejected,errors:result.errors.slice(),fileDetails:state.importFileDetails||[],runtimeReadout:runtimeDiagnostics.slice()}; state.importHistory=state.importHistory.filter(x=>{if(!String(x?.name||'').startsWith(TARGET_FILE_PREFIX))return true;const y=Number(x?.year||0);return !y||y===targetYear||y===priorYear}).slice(0,200); state.importSettings={...(state.importSettings||{}),targetYear,priorYear};
     return result;
   }
-  return {CLIENT_KEY,getClientId,setClientId,ready,authorize,signOut,listCandidateFiles,scanAndImport,classifyPdfText,parseSalaryPdf,parseBonusPdf,parseWithholdingPdf,extractLabeledNumber,extractToyotaPayrollAmount,extractExactYenAfterLabel,upsertSalaryRecord,upsertBonusRecord,ensurePdfText,getRuntimeDiagnostics,clearRuntimeDiagnostics};
+  return {CLIENT_KEY,getClientId,setClientId,ready,authorize,signOut,listCandidateFiles,scanAndImport,classifyPdfText,parseSalaryPdf,parseBonusPdf,parseWithholdingPdf,extractLabeledNumber,extractToyotaPayrollAmount,extractExactYenAfterLabel,upsertSalaryRecord,upsertBonusRecord,ensurePdfText,getRuntimeDiagnostics,clearRuntimeDiagnostics,getLastOcrImageDataUrl:()=>lastOcrImageDataUrl};
 })();
 if(typeof window!=='undefined')window.FurusatoGoogleDrive=FurusatoGoogleDrive;
 if(typeof module!=='undefined')module.exports={FurusatoImport,FurusatoGoogleDrive};
