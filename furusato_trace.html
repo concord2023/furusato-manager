@@ -1,0 +1,146 @@
+<!doctype html>
+<html lang="ja">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<title>furusato-manager 詳細トレース</title>
+<style>
+body{font-family:-apple-system,BlinkMacSystemFont,sans-serif;padding:16px;line-height:1.45}
+button{font-size:16px;padding:10px 14px;margin:4px 0}
+pre{white-space:pre-wrap;word-break:break-word;background:#f5f5f5;padding:12px;border-radius:8px}
+.ok{color:#087f23}.err{color:#b00020}
+</style>
+</head>
+<body>
+<h2>furusato-manager 詳細トレース</h2>
+<p>これは本体を変更せず、<code>settings.html</code> の「給与・賞与・源泉徴収PDFを検索して取り込む」処理が、クリック後のどこで止まるかを調べます。</p>
+<button id="run">診断開始</button>
+<button id="copy">結果をコピー</button>
+<pre id="out">まだ診断していません。</pre>
+<script>
+const BASE=location.origin+location.pathname.replace(/[^\/]+$/,'');
+const out=document.getElementById('out');
+let logs=[];
+function log(type,msg,data){
+  const x={time:new Date().toISOString(),type,msg};
+  if(data!==undefined)x.data=data;
+  logs.push(x); out.textContent=JSON.stringify(logs,null,2);
+}
+function esc(s){return s.replace(/\\/g,'\\\\').replace(/`/g,'\\`').replace(/\$/g,'\\$')}
+async function fetchText(path){
+  const r=await fetch(BASE+path,{cache:'no-store'});
+  const t=await r.text();
+  log('fetch',path,{status:r.status,contentType:r.headers.get('content-type'),bytes:t.length});
+  return t;
+}
+function inject(html){
+  const probe=`<script>
+(function(){
+  const send=(type,msg,data)=>{
+    try{parent.postMessage({__furusatoTrace:1,type,msg,data,time:new Date().toISOString()},'*')}catch(e){}
+  };
+  const safe=(v)=>{try{return typeof v==='string'?v:JSON.stringify(v)}catch(e){return String(v)}};
+  window.addEventListener('error',e=>send('ERROR',e.message||'window error',{file:e.filename,line:e.lineno,col:e.colno,stack:e.error&&e.error.stack}));
+  window.addEventListener('unhandledrejection',e=>send('UNHANDLED_REJECTION',safe(e.reason),{stack:e.reason&&e.reason.stack}));
+  const oldConsoleError=console.error;
+  console.error=function(){send('CONSOLE_ERROR',Array.from(arguments).map(safe).join(' '));return oldConsoleError.apply(this,arguments)};
+  const oldAlert=window.alert;
+  window.alert=function(x){send('ALERT',String(x));return oldAlert.call(this,x)};
+  const oldConfirm=window.confirm;
+  window.confirm=function(x){send('CONFIRM',String(x));return oldConfirm.call(this,x)};
+  const oldFetch=window.fetch;
+  window.fetch=function(){
+    const a=arguments[0], opts=arguments[1];
+    const u=typeof a==='string'?a:(a&&a.url)||String(a);
+    const method=(opts&&opts.method)||((a&&a.method)||'GET');
+    send('FETCH_START',u,{method});
+    let p;
+    try{p=oldFetch.apply(this,arguments)}catch(e){send('FETCH_THROW',u,{error:String(e),stack:e.stack});throw e}
+    return p.then(r=>{
+      send('FETCH_RESPONSE',u,{status:r.status,ok:r.ok,type:r.type,contentType:r.headers.get('content-type')});
+      return r;
+    }).catch(e=>{send('FETCH_ERROR',u,{error:String(e),stack:e.stack});throw e});
+  };
+  const oldOpen=XMLHttpRequest.prototype.open, oldSend=XMLHttpRequest.prototype.send;
+  XMLHttpRequest.prototype.open=function(m,u){this.__ft={m,u};return oldOpen.apply(this,arguments)};
+  XMLHttpRequest.prototype.send=function(b){
+    send('XHR_START',this.__ft&&this.__ft.u,{method:this.__ft&&this.__ft.m});
+    this.addEventListener('load',()=>send('XHR_RESPONSE',this.__ft&&this.__ft.u,{status:this.status,contentType:this.getResponseHeader('content-type')}));
+    this.addEventListener('error',()=>send('XHR_ERROR',this.__ft&&this.__ft.u,{status:this.status}));
+    return oldSend.apply(this,arguments);
+  };
+  const oldAdd=EventTarget.prototype.addEventListener;
+  EventTarget.prototype.addEventListener=function(type,fn,opt){
+    if(this&&this.id)send('LISTENER_REGISTER',{id:this.id,tag:this.tagName,type});
+    return oldAdd.call(this,type,fn,opt);
+  };
+  document.addEventListener('click',e=>{
+    const t=e.target&&e.target.closest?e.target.closest('button,input,a,[role=button]'):e.target;
+    if(t)send('CLICK',{tag:t.tagName,id:t.id||'',text:(t.innerText||t.value||'').trim().slice(0,160),disabled:!!t.disabled});
+  },true);
+  const snap=()=>{
+    const b=document.getElementById('googleScan');
+    send('SNAPSHOT','googleScan state',b?{
+      exists:true,disabled:!!b.disabled,text:(b.innerText||'').trim(),
+      display:getComputedStyle(b).display,visibility:getComputedStyle(b).visibility,
+      pointerEvents:getComputedStyle(b).pointerEvents
+    }:{exists:false});
+  };
+  document.addEventListener('DOMContentLoaded',()=>{send('READY','settings DOMContentLoaded');snap()});
+  [0,100,500,1000,3000,10000,30000].forEach(ms=>setTimeout(snap,ms));
+  send('INJECTED','trace probe installed');
+})();
+<\/script>`;
+  if(/<head[^>]*>/i.test(html)) return html.replace(/<head[^>]*>/i,m=>m+probe);
+  return probe+html;
+}
+window.addEventListener('message',e=>{
+  if(e.data&&e.data.__furusatoTrace) log(e.data.type,e.data.msg,e.data.data);
+});
+document.getElementById('run').onclick=async()=>{
+  logs=[]; out.textContent='診断中...';
+  try{
+    log('START','詳細トレース開始',{base:BASE,url:location.href});
+    const settings=await fetchText('settings.html');
+    const integ=await fetchText('integration.js');
+    const app=await fetchText('app.js').catch(e=>'');
+    const srcs=[
+      ['settings.html',settings],
+      ['integration.js',integ],
+      ['app.js',app]
+    ];
+    for(const [name,text] of srcs){
+      if(!text)continue;
+      for(const term of ['googleScan','googleSaveClient','googleConnect','ensurePdfText']){
+        let pos=0,n=0;
+        while((pos=text.indexOf(term,pos))>=0 && n<8){
+          log('SOURCE_MATCH',name+' contains '+term,{position:pos,snippet:text.slice(Math.max(0,pos-500),Math.min(text.length,pos+1200))});
+          pos+=term.length;n++;
+        }
+      }
+    }
+    const frame=document.createElement('iframe');
+    frame.style.cssText='position:fixed;left:-99999px;top:0;width:1px;height:1px;border:0';
+    document.body.appendChild(frame);
+    const traced=inject(settings);
+    frame.addEventListener('load',()=>log('FRAME_LOAD','instrumented settings loaded'));
+    frame.srcdoc=traced;
+    log('RUN','googleScanを自動クリックします');
+    setTimeout(()=>{
+      try{
+        const doc=frame.contentDocument;
+        const b=doc&&doc.getElementById('googleScan');
+        if(b){log('AUTO_CLICK','googleScan found in instrumented frame');b.click()}
+        else log('AUTO_CLICK_FAIL','googleScan not found after load');
+      }catch(e){log('AUTO_CLICK_ERROR',String(e),{stack:e.stack})}
+    },2500);
+    setTimeout(()=>log('END','30秒トレース継続中。結果を確認してください'),3000);
+  }catch(e){log('FATAL',String(e),{stack:e.stack})}
+};
+document.getElementById('copy').onclick=async()=>{
+  await navigator.clipboard.writeText(out.textContent);
+  alert('診断結果をコピーしました');
+};
+</script>
+</body>
+</html>
