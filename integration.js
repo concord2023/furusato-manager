@@ -114,15 +114,14 @@ const FurusatoGoogleDrive = (() => {
     const pdf=window.pdfjsLib||window.pdfjs;if(!pdf)throw new Error('PDF解析ライブラリを読み込めませんでした');
     if(pdf.GlobalWorkerOptions)pdf.GlobalWorkerOptions.workerSrc='https://cdnjs.cloudflare.com/ajax/libs/pdf.js/3.11.174/pdf.worker.min.js';
     const bytes=arrayBuffer instanceof ArrayBuffer?new Uint8Array(arrayBuffer.slice(0)):new Uint8Array(arrayBuffer);
-    const tryOpen=async(opts)=>{try{return await pdf.getDocument({...opts,disableWorker:true}).promise}catch(e){return null}};
-    // iOS/Safari can occasionally return an empty text layer for the same PDF
-    // even though the PDF itself is perfectly readable. Try the direct byte
-    // loader first, then a Blob URL loader. Never reuse a transferred buffer.
-    let doc=await tryOpen({data:new Uint8Array(bytes)});
-    if(!doc){
-      const blob=new Blob([bytes],{type:'application/pdf'}); const url=URL.createObjectURL(blob);
-      try{doc=await tryOpen({url})}finally{URL.revokeObjectURL(url)}
-    }
+    const tryOpen=async(opts)=>{try{return await pdf.getDocument(opts).promise}catch(e){return null}};
+    // Safari/iOS can expose an empty text layer for these Toyota PDFs. Prefer a
+    // Blob URL so PDF.js can use its normal worker/render path, then fall back to
+    // a copied Uint8Array with the worker disabled. Never reuse a transferred buffer.
+    let doc=null;
+    const blob=new Blob([bytes],{type:'application/pdf'}); const url=URL.createObjectURL(blob);
+    try{doc=await tryOpen({url})}finally{URL.revokeObjectURL(url)}
+    if(!doc)doc=await tryOpen({data:new Uint8Array(bytes),disableWorker:true});
     if(!doc)throw new Error('PDFを開けませんでした');
     let text=''; const pages=[]; let itemCount=0;
     for(let i=1;i<=doc.numPages;i++){
@@ -145,7 +144,7 @@ const FurusatoGoogleDrive = (() => {
   }
   async function ocrPageFromPdfDoc(doc,region=null,options={}){
     if(!doc)throw new Error('OCR用PDFドキュメントがありません');
-    const page=await doc.getPage(1); const scale=Number(options.scale||region?.scale||2.6); const full=page.getViewport({scale});
+    const page=await doc.getPage(1); const scale=Number(options.scale||region?.scale||3.0); const full=page.getViewport({scale});
     const r=region||{x0:0,y0:0,x1:1,y1:1};
     const sx=Math.max(0,Math.min(1,Number(r.x0)||0)),sy=Math.max(0,Math.min(1,Number(r.y0)||0));
     const ex=Math.max(sx,Math.min(1,Number(r.x1)==null?1:Number(r.x1))),ey=Math.max(sy,Math.min(1,Number(r.y1)==null?1:Number(r.y1)));
@@ -155,8 +154,10 @@ const FurusatoGoogleDrive = (() => {
     if(!window.Tesseract)await loadScript('https://cdn.jsdelivr.net/npm/tesseract.js@5/dist/tesseract.min.js');
     if(!window.Tesseract?.recognize)throw new Error('OCRライブラリを読み込めませんでした');
     const psm=String(options.psm||11);
-    const rOcr=await window.Tesseract.recognize(canvas,'jpn+eng',{tessedit_pageseg_mode:psm,preserve_interword_spaces:'1'});
-    return {text:String(rOcr?.data?.text||''),pages:[],pageCount:doc.numPages,textItemCount:0,ocrUsed:true,ocrConfidence:Number(rOcr?.data?.confidence||0),ocrPsm:psm};
+    const lang=String(options.lang||'jpn+eng');
+    const rOcr=await window.Tesseract.recognize(canvas,lang,{tessedit_pageseg_mode:psm,preserve_interword_spaces:'1'});
+    const data=rOcr?.data||{};
+    return {text:String(data.text||''),words:Array.isArray(data.words)?data.words:[],pages:[],pageCount:doc.numPages,textItemCount:0,ocrUsed:true,ocrConfidence:Number(data.confidence||0),ocrPsm:psm,ocrLang:lang,ocrWidth:cw,ocrHeight:ch,ocrRegion:!!region};
   }
   function ocrQuality(text,confidence=0){
     const t=String(text||''); const digits=(t.match(/\d/g)||[]).length;
@@ -181,14 +182,45 @@ const FurusatoGoogleDrive = (() => {
       // Keep both layouts. Sparse PSM 11 is good at Japanese labels, while PSM
       // 6 often preserves the numeric summary row. Choosing only one can lose
       // either the label or its value, so the parser receives their union.
-      attempts.push(await ocrPageFromPdfDoc(base.pdfDoc,null,{scale:2.6,psm:11}));
-      attempts.push(await ocrPageFromPdfDoc(base.pdfDoc,null,{scale:2.8,psm:6}));
-      if(type==='salary' && ocrQuality(attempts[0].text+'\n'+attempts[1].text,Math.max(attempts[0].ocrConfidence||0,attempts[1].ocrConfidence||0))<260){
-        attempts.push(await ocrPageFromPdfDoc(base.pdfDoc,{x0:0,y0:0.68,x1:0.75,y1:1},{scale:3.0,psm:11}));
+      attempts.push(await ocrPageFromPdfDoc(base.pdfDoc,null,{scale:3.0,psm:11,lang:'jpn+eng'}));
+      attempts.push(await ocrPageFromPdfDoc(base.pdfDoc,null,{scale:3.0,psm:6,lang:'jpn+eng'}));
+      const firstText=attempts.map(x=>String(x.text||'')).join('\n');
+      // Numeric fields on this payroll are often recognized more reliably by the
+      // English model than by the mixed Japanese model. Use it only when the
+      // first OCR pass is too sparse; this is a fallback, not the primary parser.
+      if(ocrQuality(firstText,Math.max(...attempts.map(x=>Number(x.ocrConfidence||0))))<260){
+        attempts.push(await ocrPageFromPdfDoc(base.pdfDoc,null,{scale:3.0,psm:11,lang:'eng'}));
       }
-      const mergedText=attempts.map(x=>String(x.text||'')).filter(Boolean).join('\n');
-      const best=attempts.slice().sort((a,b)=>ocrQuality(b.text,b.ocrConfidence)-ocrQuality(a.text,a.ocrConfidence))[0];
-      if(best)return {...base,text:mergedText||raw,ocrText:mergedText,ocrUsed:true,ocrConfidence:Math.max(...attempts.map(x=>Number(x.ocrConfidence||0))),ocrPsm:attempts.map(x=>x.ocrPsm).join(','),ocrAttempts:attempts.map(x=>({psm:x.ocrPsm,chars:String(x.text||'').length,confidence:x.ocrConfidence||0}))};
+      if(type==='salary' && ocrQuality(attempts.map(x=>x.text).join('\n'),Math.max(...attempts.map(x=>x.ocrConfidence||0)))<260){
+        attempts.push(await ocrPageFromPdfDoc(base.pdfDoc,{x0:0,y0:0.68,x1:0.75,y1:1},{scale:3.2,psm:11,lang:'jpn+eng'}));
+      }
+      const nonEmpty=attempts.filter(x=>String(x.text||'').trim().length>=20);
+      if(!nonEmpty.length)throw new Error('OCR結果が空または短すぎます');
+      const mergedText=nonEmpty.map(x=>String(x.text||'')).join('\n');
+      // Do not merely choose the OCR pass with the most characters. A pass can
+      // be long but still be useless for payroll parsing. Prefer a pass that
+      // independently produces a validated record, then use quality as the
+      // tie-breaker. This directly guards the former "OCR=実行／文字数だけ"
+      // false-success path.
+      const parseAttempt=(a)=>{
+        try{
+          const q={...a,ocrText:a.text,ocrUsed:true};
+          if(type==='salary')return !parseSalaryPdf(q,name).needsReview;
+          if(type==='bonus')return !parseBonusPdf(q,name).needsReview;
+          if(type==='withholding')return !parseWithholdingPdf(q,name).needsReview;
+        }catch{}
+        return false;
+      };
+      const valid=nonEmpty.filter(parseAttempt);
+      const ranked=(valid.length?valid:nonEmpty).slice().sort((a,b)=>{
+        const av=ocrQuality(a.text,a.ocrConfidence),bv=ocrQuality(b.text,b.ocrConfidence);
+        return bv-av;
+      });
+      const best=ranked[0];
+      const wordSource=valid.find(x=>!x.ocrRegion&&Array.isArray(x.words)&&x.words.length)
+        ||nonEmpty.find(x=>!x.ocrRegion&&Array.isArray(x.words)&&x.words.length)
+        ||best;
+      return {...base,text:mergedText,ocrText:mergedText,ocrUsed:true,ocrConfidence:Math.max(...attempts.map(x=>Number(x.ocrConfidence||0))),ocrPsm:attempts.map(x=>x.ocrPsm).join(','),ocrWords:wordSource.words||[],ocrWordCount:Array.isArray(wordSource.words)?wordSource.words.length:0,ocrWidth:wordSource.ocrWidth,ocrHeight:wordSource.ocrHeight,ocrAttempts:attempts.map(x=>({psm:x.ocrPsm,lang:x.ocrLang,chars:String(x.text||'').length,confidence:x.ocrConfidence||0,words:Array.isArray(x.words)?x.words.length:0,valid:valid.includes(x)})),ocrValidated:valid.length>0};
     }catch(e){return {...base,text:raw,ocrText:'',ocrUsed:true,ocrError:e?.message||String(e)};}
     return {...base,text:raw,ocrUsed:true,ocrError:'OCR結果が空でした'};
   }
@@ -508,6 +540,69 @@ const FurusatoGoogleDrive = (() => {
     const raw=typeof textOrPdf==='string'?textOrPdf:(textOrPdf?.text||'');
     return extractNumericTokens(raw).map(x=>x.n).filter(n=>n<1000000000&&!(n>=1900&&n<=2100));
   }
+  function ocrWordNumbers(textOrPdf){
+    const words=Array.isArray(textOrPdf?.ocrWords)?textOrPdf.ocrWords:[];
+    const raw=[];
+    for(const w of words){
+      const text=String(w?.text||w?.str||'').trim(); if(!text)continue;
+      const b=w.bbox||{}; const x=Number(b.x0??w.x??0),y=Number(b.y0??w.y??0),x1=Number(b.x1??(x+Number(w.width||0))),y1=Number(b.y1??(y+Number(w.height||0)));
+      raw.push({text,x,y,x1,y1,conf:Number(w.confidence??w.conf??0)});
+    }
+    // Tesseract commonly splits 19,132,057 into three words. Recombine only
+    // adjacent numeric-looking words on the same visual row.
+    const out=[];
+    for(const w of raw){
+      const isNum=/^[-+]?\d[\d,.]*$/.test(w.text);
+      if(!isNum)continue;
+      const prev=out[out.length-1];
+      if(prev&&Math.abs(prev.y-w.y)<=10&&w.x-prev.x1<=30&&/[,\.]$/.test(prev.text)){
+        prev.text+=w.text;prev.x1=w.x1;prev.y1=Math.max(prev.y1,w.y1);prev.conf=Math.min(prev.conf||0,w.conf||0);
+      }else{out.push({...w});}
+    }
+    return out.map(w=>{const n=normalizeNumericToken(w.text);return {...w,n}}).filter(w=>Number.isFinite(w.n)&&w.n>=100&&w.n<1000000000&&!(w.n>=1900&&w.n<=2100));
+  }
+  function ocrRegionNumbers(textOrPdf,region){
+    const nums=ocrWordNumbers(textOrPdf); if(!nums.length)return [];
+    const maxX=Number(textOrPdf.ocrWidth)||Math.max(...nums.map(x=>x.x1),1),maxY=Number(textOrPdf.ocrHeight)||Math.max(...nums.map(x=>x.y1),1);
+    const x0=(region.x0??0)*maxX,x1=(region.x1??1)*maxX,y0=(region.y0??0)*maxY,y1=(region.y1??1)*maxY;
+    return nums.filter(n=>n.x>=x0&&n.x1<=x1&&n.y>=y0&&n.y<=y1).sort((a,b)=>a.y-b.y||a.x-b.x);
+  }
+  function ocrPayrollFallback(textOrPdf,type){
+    if(!textOrPdf?.ocrUsed||!Array.isArray(textOrPdf?.ocrWords)||!textOrPdf.ocrWords.length)return null;
+    if(type==='salary'){
+      const summary=ocrRegionNumbers(textOrPdf,{x0:.16,x1:.34,y0:.84,y1:1});
+      const social=ocrRegionNumbers(textOrPdf,{x0:.36,x1:.47,y0:.24,y1:.46});
+      const byY=[]; for(const n of social){let g=byY.find(v=>Math.abs(v.y-n.y)<12);if(!g){g={y:n.y,n:n.n};byY.push(g)}else if(String(n.n).length>=String(g.n).length)g.n=n.n;}
+      const vals=byY.sort((a,b)=>a.y-b.y).map(x=>x.n);
+      const svals=summary.sort((a,b)=>a.y-b.y).map(x=>x.n);
+      const out={};
+      // The Toyota slip has a stable bottom summary: non-taxable then taxable.
+      const nonTax=svals.find(n=>n>=1000&&n<100000);
+      const taxable=svals.find(n=>n>=100000&&n<2000000);
+      if(nonTax!=null)out.nonTaxableTotal=nonTax;
+      if(taxable!=null)out.taxableGross=taxable;
+      if(taxable!=null&&nonTax!=null)out.grossTotal=taxable+nonTax;
+      if(vals.length>=6){out.socialComponents={employmentInsurance:vals[0],healthInsurance:vals[1],healthInsuranceSpecial:vals[2],nursingCare:vals[3],childSupport:vals[4],pension:vals[5]};out.socialTotal=vals.reduce((a,v)=>a+v,0)}
+      return out;
+    }
+    if(type==='withholding'){
+      const top=ocrRegionNumbers(textOrPdf,{x0:.24,x1:.97,y0:.18,y1:.27});
+      const topRows=[];for(const n of top){let g=topRows.find(v=>Math.abs(v.y-n.y)<18);if(!g){g={y:n.y,items:[n]}}else g.items.push(n);if(!topRows.includes(g))topRows.push(g)}
+      const row=(topRows.sort((a,b)=>a.y-b.y)[0]?.items||[]).sort((a,b)=>a.x-b.x).map(x=>x.n);
+      const sec=ocrRegionNumbers(textOrPdf,{x0:.10,x1:.70,y0:.34,y1:.40});
+      const secRow=[];for(const n of sec){let g=secRow.find(v=>Math.abs(v.y-n.y)<18);if(!g)secRow.push({y:n.y,items:[n]});else g.items.push(n)}
+      const sv=(secRow.sort((a,b)=>a.y-b.y)[0]?.items||[]).sort((a,b)=>a.x-b.x).map(x=>x.n);
+      const lower=ocrRegionNumbers(textOrPdf,{x0:.68,x1:.98,y0:.57,y1:.66});
+      const lowerRow=lower.sort((a,b)=>a.x-b.x).map(x=>x.n);
+      const out={};
+      if(row.length>=4){out.annualSalary=row[0];out.salaryIncomeAfterDeduction=row[1];out.deductionsTotal=row[2];out.incomeTax=row[3]}
+      if(sv.length>=3){out.specialDependent=sv[0];out.social=sv[1];out.lifeInsuranceDeduction=sv[2]}
+      const basics=ocrRegionNumbers(textOrPdf,{x0:.68,x1:.98,y0:.55,y1:.65});
+      const basicVals=basics.sort((a,b)=>a.x-b.x).map(x=>x.n); if(basicVals.length>=2){out.basicDeduction=basicVals[0];out.incomeAdjustment=basicVals[basicVals.length-1]}
+      return out;
+    }
+    return null;
+  }
   function parseSalaryComponents(text){
     const s=cleanPdfText(typeof text==='string'?text:text?.text||'');
     // Structured summary fields are authoritative. Parse them by exact label,
@@ -574,11 +669,19 @@ const FurusatoGoogleDrive = (() => {
     // the normal PDF parser and the OCR parser.
     if(text&&typeof text==='object'&&text.ocrText){
       const o=parseSalaryComponents({text:text.ocrText,pages:[]});
-      if(c.taxableGross==null&&o.taxableGross!=null)c={...c,taxableGross:o.taxableGross};
-      if(c.grossTotal==null&&o.grossTotal!=null)c={...c,grossTotal:o.grossTotal};
-      if(c.nonTaxableTotal==null&&o.nonTaxableTotal!=null)c={...c,nonTaxableTotal:o.nonTaxableTotal};
-      if(c.socialTotal==null&&o.socialTotal!=null)c={...c,socialTotal:o.socialTotal,socialComponents:o.socialComponents};
+      const f=ocrPayrollFallback(text,'salary')||{};
+      c={...c,
+        taxableGross:f.taxableGross??o.taxableGross??c.taxableGross,
+        grossTotal:f.grossTotal??o.grossTotal??c.grossTotal,
+        nonTaxableTotal:f.nonTaxableTotal??o.nonTaxableTotal??c.nonTaxableTotal,
+        socialTotal:f.socialTotal??o.socialTotal??c.socialTotal,
+        socialComponents:f.socialComponents??o.socialComponents??c.socialComponents
+      };
       if(!c.components?.length&&o.grossComponents?.length)c={...c,grossComponents:o.grossComponents};
+      if(c.taxableGross!=null&&c.nonTaxableTotal!=null&&c.grossTotal==null)c.grossTotal=c.taxableGross+c.nonTaxableTotal;
+      const derived=(c.grossTotal!=null&&c.nonTaxableTotal!=null)?c.grossTotal-c.nonTaxableTotal:null;
+      const socialOk=Object.values(c.socialComponents||{}).length===6&&Object.values(c.socialComponents||{}).every(v=>Number.isFinite(v));
+      c={...c,unknownComponents:[...(c.grossTotal==null?['支給合計']:[]),...(c.nonTaxableTotal==null?['非課税分']:[]),...(c.taxableGross==null?['課税対象額']:[]),...(c.socialTotal==null?['社会保険料']:[])],arithmeticOk:derived!=null&&c.taxableGross===derived&&socialOk,needsReview:!(derived!=null&&c.taxableGross===derived&&socialOk)};
     }
     const taxableGross=Number.isFinite(c.taxableGross)&&c.taxableGross>0?c.taxableGross:null;
     const grossTotal=Number.isFinite(c.grossTotal)&&c.grossTotal>0?c.grossTotal:null;
@@ -733,9 +836,9 @@ const FurusatoGoogleDrive = (() => {
       }
       if(vals.length>=3){specialRow=vals[0];socialRow=vals[1];lifeRow=vals[2];}
     }
-    const specialDependent=specialRow??pick('特定親族特別控除の額');
-    const social=socialRow??pick('社会保険料等の金額');
-    const lifeInsuranceDeduction=lifeRow??pick('生命保険料の控除額');
+    let specialDependent=specialRow??pick('特定親族特別控除の額');
+    let social=socialRow??pick('社会保険料等の金額');
+    let lifeInsuranceDeduction=lifeRow??pick('生命保険料の控除額');
     const earthquakeInsuranceDeduction=extractOcrSameLineNumber(text,['地震保険料の控除額']);
     const housingLoanDeduction=extractOcrSameLineNumber(text,['住宅借入金等特別控除の額']);
     let basicDeduction=pick('基礎控除の額');
@@ -752,8 +855,26 @@ const FurusatoGoogleDrive = (() => {
     const nursingInsurance=detailVals[2]??pick('介護医療保険料の金額');
     const newPension=pick('新個人年金保険料の金額');
     const oldPension=detailVals[3]??pick('旧個人年金保険料の金額');
+    if(text&&typeof text==='object'&&text.ocrWords?.length){
+      const f=ocrPayrollFallback(text,'withholding')||{};
+      annualSalary=f.annualSalary??annualSalary;
+      salaryIncomeAfterDeduction=f.salaryIncomeAfterDeduction??salaryIncomeAfterDeduction;
+      deductionsTotal=f.deductionsTotal??deductionsTotal;
+      incomeTax=f.incomeTax??incomeTax;
+      social=f.social??social;
+      lifeInsuranceDeduction=f.lifeInsuranceDeduction??lifeInsuranceDeduction;
+      specialDependent=f.specialDependent??specialDependent;
+      basicDeduction=f.basicDeduction??basicDeduction;
+      // OCR can read the 580,000 field as just "580" when the trailing
+      // zeros are visually merged with the neighboring cell. In a yen-valued
+      // basic-deduction field, a three-digit OCR result is incomplete.
+      if(Number.isFinite(basicDeduction)&&basicDeduction>=100&&basicDeduction<1000)basicDeduction*=1000;
+      incomeAdjustment=f.incomeAdjustment??incomeAdjustment;
+    }
     const required=[annualSalary,salaryIncomeAfterDeduction,deductionsTotal,incomeTax,social];
-    const arithmeticOk=required.every(Number.isFinite);
+    const fieldsPresent=required.every(Number.isFinite);
+    const relationsOk=fieldsPresent&&annualSalary>salaryIncomeAfterDeduction&&salaryIncomeAfterDeduction>0&&deductionsTotal>=social&&incomeTax>=0&&incomeTax<=annualSalary;
+    const arithmeticOk=fieldsPresent&&relationsOk;
     return {year,annualSalary,salaryIncomeAfterDeduction,deductionsTotal,social,incomeTax,lifeInsuranceDeduction,earthquakeInsuranceDeduction,housingLoanDeduction,specialDependent,basicDeduction,incomeAdjustment,newLifeInsurance,oldLifeInsurance,nursingInsurance,newPension,oldPension,document:name,source:'google-drive',status:'actual',arithmeticOk,needsReview:!arithmeticOk};
   }
   function uniquePush(arr,item,key){const k=key(item);if(!arr.some(x=>key(x)===k))arr.push(item);}
@@ -827,13 +948,13 @@ const FurusatoGoogleDrive = (() => {
     state.priorSalaryRecords=(state.priorSalaryRecords||[]).filter(x=>Number(x.year)===priorYear); state.priorBonusRecords=(state.priorBonusRecords||[]).filter(x=>Number(x.year)===priorYear); state.priorSocialRecords=(state.priorSocialRecords||[]).filter(x=>Number(x.year)===priorYear);
     for(const f of files){
       try{
-        onProgress?.(`解析中: ${f.name}`); const buf=await downloadPdf(f.id); let pdf=await pdfText(buf); pdf=await ensurePdfText(buf,pdf,f.name); const text=pdf.text,detectedType=classifyPdfText(text,f.name),type=detectedType==='unknown' ? ({salary:'salary_slip',bonus:'bonus_slip',withholding:'withholding'}[f.candidateType]||detectedType) : detectedType; const detail={name:f.name,id:f.id,type:f.candidateType,filenameYear:f.filenameYear||null,detectedType:type,textChars:String(text||'').length,textItemCount:pdf.textItemCount||0,ocrUsed:!!pdf.ocrUsed,ocrConfidence:pdf.ocrConfidence||0,ocrError:pdf.ocrError||''}; state.importFileDetails.push(detail);
+        onProgress?.(`解析中: ${f.name}`); const buf=await downloadPdf(f.id); let pdf=await pdfText(buf); pdf=await ensurePdfText(buf,pdf,f.name); const text=pdf.text,detectedType=classifyPdfText(text,f.name),type=detectedType==='unknown' ? ({salary:'salary_slip',bonus:'bonus_slip',withholding:'withholding'}[f.candidateType]||detectedType) : detectedType; const detail={name:f.name,id:f.id,type:f.candidateType,filenameYear:f.filenameYear||null,detectedType:type,textChars:String(text||'').length,textItemCount:pdf.textItemCount||0,ocrUsed:!!pdf.ocrUsed,ocrConfidence:pdf.ocrConfidence||0,ocrError:pdf.ocrError||'',ocrWordCount:pdf.ocrWordCount||0,ocrValidated:!!pdf.ocrValidated,ocrAttempts:pdf.ocrAttempts||[]}; state.importFileDetails.push(detail);
         if(type==='salary_slip'){
           const x=parseSalaryPdf(pdf,f.name); Object.assign(detail,{year:x.year||null,month:x.month||null,gross:x.gross||0,taxableGross:x.taxableGross||0,grossTotal:x.grossTotal||0,nonTaxableTotal:x.nonTaxableTotal||0,social:x.social||0,components:x.components||{},socialComponents:x.socialComponents||{},needsReview:!!x.needsReview}); x.ocrUsed=!!pdf.ocrUsed; if(x.ocrUsed)result.salaryOcr++; x.ocrConfidence=pdf.ocrConfidence||0; x.textItemCount=pdf.textItemCount||0; x.textChars=String(pdf.text||'').length; x.ocrError=pdf.ocrError||''; const inScope=[targetYear,priorYear].includes(Number(x.year));
           if(!inScope){result.skipped++; recordHistory(state,{at:new Date().toISOString(),name:f.name,type:'salary',year:x.year||f.filenameYear||null,status:'対象外',reason:'対象年/前年ではない'});continue}
           if(upsertSalaryRecord(state,x,f,targetYear,result)){
-            recordHistory(state,{at:new Date().toISOString(),name:f.name,type:'salary',year:x.year,month:x.month,status:'取り込み済み',taxableGross:x.taxableGross,grossTotal:x.grossTotal,social:x.social,needsReview:!!x.needsReview,ocrUsed:!!x.ocrUsed,ocrConfidence:x.ocrConfidence||0,textChars:x.textChars||0,textItemCount:x.textItemCount||0,ocrError:x.ocrError||''});
-          } else if(x.year===priorYear&&x.month&&x.gross){uniquePush(state.priorSalaryRecords,{year:priorYear,month:x.month,gross:x.taxableGross,taxableGross:x.taxableGross,grossTotal:x.grossTotal,nonTaxableTotal:x.nonTaxableTotal,components:x.components||[],source:'google-drive',status:'prior',document:f.name,driveFileId:f.id,needsReview:x.needsReview},v=>`${v.year}-${v.month}-${v.document}`);if(x.social!=null)uniquePush(state.priorSocialRecords,{year:priorYear,month:x.month,amount:x.social,components:x.socialComponents||{},source:'google-drive',status:'prior',document:f.name,driveFileId:f.id},v=>`${v.year}-${v.month}-${v.document}`);result.added++;recordHistory(state,{at:new Date().toISOString(),name:f.name,type:'salary',year:x.year,month:x.month,status:'前年保存',taxableGross:x.taxableGross,grossTotal:x.grossTotal,social:x.social,needsReview:!!x.needsReview,ocrUsed:!!x.ocrUsed,ocrConfidence:x.ocrConfidence||0,textChars:x.textChars||0,textItemCount:x.textItemCount||0,ocrError:x.ocrError||''});}else {result.review++; if(f.candidateType==='salary'){result.salaryReview++;result.salaryRejected++;}recordHistory(state,{at:new Date().toISOString(),name:f.name,type:'salary',year:x.year||f.filenameYear||null,month:x.month||null,status:'確認待ち',taxableGross:x.taxableGross,grossTotal:x.grossTotal,social:x.social,needsReview:true,reason:`給与登録できませんでした：課税対象額=${x.taxableGross==null?'取得失敗':x.taxableGross}／支給合計=${x.grossTotal==null?'取得失敗':x.grossTotal}／非課税=${x.nonTaxableTotal==null?'取得失敗':x.nonTaxableTotal}／年月=${x.year||f.filenameYear||'不明'}-${x.month||'不明'}／OCR=${x.ocrUsed?'実行':'未実行'}${x.ocrError?`／OCRエラー=${x.ocrError}`:''}／文字数=${x.textChars||0}／文字項目=${x.textItemCount||0}`});}
+            recordHistory(state,{at:new Date().toISOString(),name:f.name,type:'salary',year:x.year,month:x.month,status:'取り込み済み',taxableGross:x.taxableGross,grossTotal:x.grossTotal,social:x.social,needsReview:!!x.needsReview,ocrUsed:!!x.ocrUsed,ocrConfidence:x.ocrConfidence||0,textChars:x.textChars||0,textItemCount:x.textItemCount||0,ocrWordCount:pdf.ocrWordCount||0,ocrValidated:!!pdf.ocrValidated,ocrError:x.ocrError||''});
+          } else if(x.year===priorYear&&x.month&&x.gross){uniquePush(state.priorSalaryRecords,{year:priorYear,month:x.month,gross:x.taxableGross,taxableGross:x.taxableGross,grossTotal:x.grossTotal,nonTaxableTotal:x.nonTaxableTotal,components:x.components||[],source:'google-drive',status:'prior',document:f.name,driveFileId:f.id,needsReview:x.needsReview},v=>`${v.year}-${v.month}-${v.document}`);if(x.social!=null)uniquePush(state.priorSocialRecords,{year:priorYear,month:x.month,amount:x.social,components:x.socialComponents||{},source:'google-drive',status:'prior',document:f.name,driveFileId:f.id},v=>`${v.year}-${v.month}-${v.document}`);result.added++;recordHistory(state,{at:new Date().toISOString(),name:f.name,type:'salary',year:x.year,month:x.month,status:'前年保存',taxableGross:x.taxableGross,grossTotal:x.grossTotal,social:x.social,needsReview:!!x.needsReview,ocrUsed:!!x.ocrUsed,ocrConfidence:x.ocrConfidence||0,textChars:x.textChars||0,textItemCount:x.textItemCount||0,ocrWordCount:pdf.ocrWordCount||0,ocrValidated:!!pdf.ocrValidated,ocrError:x.ocrError||''});}else {result.review++; if(f.candidateType==='salary'){result.salaryReview++;result.salaryRejected++;}recordHistory(state,{at:new Date().toISOString(),name:f.name,type:'salary',year:x.year||f.filenameYear||null,month:x.month||null,status:'確認待ち',taxableGross:x.taxableGross,grossTotal:x.grossTotal,social:x.social,needsReview:true,reason:`給与登録できませんでした：課税対象額=${x.taxableGross==null?'取得失敗':x.taxableGross}／支給合計=${x.grossTotal==null?'取得失敗':x.grossTotal}／非課税=${x.nonTaxableTotal==null?'取得失敗':x.nonTaxableTotal}／年月=${x.year||f.filenameYear||'不明'}-${x.month||'不明'}／OCR=${x.ocrUsed?'実行':'未実行'}${x.ocrError?`／OCRエラー=${x.ocrError}`:''}／文字数=${x.textChars||0}／文字項目=${x.textItemCount||0}`});}
         }else if(type==='bonus_slip'){
           const x=parseBonusPdf(pdf,f.name); Object.assign(detail,{year:x.year||null,month:x.month||null,date:x.date||null,amount:x.amount||0,social:x.social||0,socialComponents:x.socialComponents||{},needsReview:!!x.needsReview}); if(![targetYear,priorYear].includes(Number(x.year))){result.skipped++;continue}
           if(!upsertBonusRecord(state,x,f,targetYear,result) && x.year===priorYear && x.date&&x.amount){state.priorBonusRecords=state.priorBonusRecords||[];uniquePush(state.priorBonusRecords,{year:priorYear,date:x.date,month:x.month,amount:x.amount,social:x.social,socialComponents:x.socialComponents||{},standardBonusHealth:x.standardBonusHealth,standardBonusPension:x.standardBonusPension,source:'prior',status:'prior',document:f.name,driveFileId:f.id},v=>`${v.date}-${v.document}`);result.added++;state.importHistory.unshift({at:new Date().toISOString(),name:f.name,type:'bonus',year:x.year||f.filenameYear||null,date:x.date||null,status:'取り込み済み',amount:x.amount||null,social:x.social||null,needsReview:!!x.needsReview});}else if(!(x.date&&x.amount)){result.review++;state.importHistory.unshift({at:new Date().toISOString(),name:f.name,type:'bonus',year:x.year||f.filenameYear||null,status:'確認待ち',amount:x.amount||null,social:x.social||null,needsReview:true,reason:'賞与額または年月を取得できませんでした'});}
