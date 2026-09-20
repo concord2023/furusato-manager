@@ -79,7 +79,7 @@ table{width:100%;border-collapse:collapse;font-size:13px}td,th{padding:7px;borde
     log("diagnostic start");
     add("JavaScript","OK","診断ページのJavaScriptは実行されています。");
     add("現在URL","OK",location.href);
-    add("オンライン","navigator.onLine?"OK":"WARN",navigator.onLine?"online":"offline");
+    add("オンライン",navigator.onLine?"OK":"WARN",navigator.onLine?"online":"offline");
 
     try{
       const regs=await navigator.serviceWorker?.getRegistrations();
