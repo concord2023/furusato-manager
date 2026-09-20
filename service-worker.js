@@ -1,4 +1,4 @@
-const CACHE='furusato-manager-2026-09-20-fix2';
+const CACHE='furusato-manager-2026-09-20-fix3';
 const ASSETS=[
   './','./index.html','./details.html','./donations.html','./settings.html',
   './style.css','./app.js','./calculator.js','./data-model.js','./integration.js','./manifest.json'

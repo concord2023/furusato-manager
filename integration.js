@@ -194,7 +194,10 @@ const FurusatoGoogleDrive = (() => {
     const fullPixels=fullSample.length/4;
     // Passing an explicit opaque PNG data URL is more stable on iOS Safari.
     const imageDataUrl=canvas.toDataURL('image/png');
-    lastOcrImageDataUrl=imageDataUrl;
+    // Keep the FULL PAGE as the user-facing preview/save image. Region OCR is
+    // intentionally allowed to run for parsing, but must never replace the
+    // preview with a cropped rectangle.
+    if(!region) lastOcrImageDataUrl=imageDataUrl;
     const rOcr=await window.Tesseract.recognize(imageDataUrl,lang,{tessedit_pageseg_mode:psm,preserve_interword_spaces:'1'});
     const data=rOcr?.data||{};
     const result={text:String(data.text||''),words:Array.isArray(data.words)?data.words:[],pages:[],pageCount:doc.numPages,textItemCount:0,ocrUsed:true,ocrConfidence:Number(data.confidence||0),ocrPsm:psm,ocrLang:lang,ocrWidth:cw,ocrHeight:ch,ocrRegion:!!region,imageBytes:imageDataUrl.length,cornerNonWhite:nonWhite,cornerMean:sample.length?sum/(sample.length/4):255,renderSampleWidth:statW,renderSampleHeight:statH,renderNonWhite:fullNonWhite,renderNonWhiteRatio:fullPixels?fullNonWhite/fullPixels:0,renderMean:fullPixels?fullSum/fullPixels:255,renderMin:fullMin,renderMax:fullMax};
