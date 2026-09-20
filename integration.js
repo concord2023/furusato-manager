@@ -36,6 +36,10 @@ const FurusatoGoogleDrive = (() => {
   const SCOPES='https://www.googleapis.com/auth/drive.readonly';
   let tokenClient=null, accessToken=null;
   let readyPromise=null;
+  const runtimeDiagnostics=[];
+  function diag(entry){try{runtimeDiagnostics.push({...entry,at:new Date().toISOString()});if(runtimeDiagnostics.length>80)runtimeDiagnostics.splice(0,runtimeDiagnostics.length-80)}catch{}}
+  function getRuntimeDiagnostics(){return runtimeDiagnostics.slice()}
+  function clearRuntimeDiagnostics(){runtimeDiagnostics.length=0}
   function getClientId(){return localStorage.getItem(CLIENT_KEY)||''}
   function setClientId(v){const x=String(v||'').trim(); if(x)localStorage.setItem(CLIENT_KEY,x); else localStorage.removeItem(CLIENT_KEY); return x}
   function loadScript(src){return new Promise((resolve,reject)=>{const old=document.querySelector(`script[src="${src}"]`);if(old){old.dataset.loaded==='1'?resolve():old.addEventListener('load',resolve,{once:true});return}const s=document.createElement('script');s.src=src;s.async=true;s.defer=true;s.onload=()=>{s.dataset.loaded='1';resolve()};s.onerror=reject;document.head.appendChild(s)})}
@@ -108,7 +112,24 @@ const FurusatoGoogleDrive = (() => {
     }
     return out.sort((a,b)=>String(b.modifiedTime||'').localeCompare(String(a.modifiedTime||'')));
   }
-  async function downloadPdf(fileId){if(!accessToken)await authorize();const r=await fetch(`https://www.googleapis.com/drive/v3/files/${encodeURIComponent(fileId)}?alt=media`,{headers:{Authorization:`Bearer ${accessToken}`}});if(!r.ok)throw new Error(`Drive download failed: ${r.status}`);return await r.arrayBuffer()}
+  async function downloadPdf(fileId){
+    if(!accessToken)await authorize();
+    const url=`https://www.googleapis.com/drive/v3/files/${encodeURIComponent(fileId)}?alt=media`;
+    const started=performance.now();
+    const r=await fetch(url,{headers:{Authorization:`Bearer ${accessToken}`,Accept:'application/pdf,application/octet-stream;q=0.9,*/*;q=0.1'},cache:'no-store'});
+    const contentType=r.headers.get('content-type')||'';
+    const contentLength=r.headers.get('content-length')||'';
+    if(!r.ok){diag({stage:'download',fileId,status:r.status,contentType,contentLength,error:`Drive download failed: ${r.status}`});throw new Error(`Drive download failed: ${r.status}`)}
+    const buf=await r.arrayBuffer();
+    const bytes=new Uint8Array(buf);
+    const head=Array.from(bytes.slice(0,16)).map(x=>x.toString(16).padStart(2,'0')).join(' ');
+    const ascii=String.fromCharCode(...bytes.slice(0,16));
+    const isPdf=ascii.startsWith('%PDF-');
+    const meta={stage:'download',fileId,status:r.status,contentType,contentLength,bytes:bytes.byteLength,headHex:head,headAscii:ascii,isPdf,ms:Math.round(performance.now()-started)};
+    diag(meta);
+    if(bytes.byteLength<100||!isPdf)throw new Error(`PDF取得内容が不正です: ${isPdf?'サイズ不足':'PDF署名なし'} / ${bytes.byteLength} bytes / ${contentType}`);
+    return buf
+  }
   async function pdfText(arrayBuffer){
     if(!window.pdfjsLib)await loadScript('https://cdnjs.cloudflare.com/ajax/libs/pdf.js/3.11.174/pdf.min.js');
     const pdf=window.pdfjsLib||window.pdfjs;if(!pdf)throw new Error('PDF解析ライブラリを読み込めませんでした');
@@ -140,7 +161,9 @@ const FurusatoGoogleDrive = (() => {
       lines.sort((a,b)=>b.y-a.y);
       text+=lines.map(g=>g.items.slice().sort((a,b)=>a.x-b.x).map(x=>x.str).join(' ')).join('\n')+'\n';
     }
-    return {text,pages,pageCount:doc.numPages,textItemCount:itemCount,ocrUsed:false,pdfDoc:doc};
+    const pageMeta=pages.map((items,i)=>({page:i+1,items:items.length,textChars:items.reduce((n,x)=>n+String(x.str||'').length,0),sample:items.slice(0,12).map(x=>String(x.str||'')).join(' | ')}));
+    diag({stage:'pdfText',pageCount:doc.numPages,textItemCount:itemCount,textChars:text.length,textSample:text.slice(0,1000),pageMeta:pageMeta.slice(0,8)});
+    return {text,pages,pageCount:doc.numPages,textItemCount:itemCount,pageMeta,ocrUsed:false,pdfDoc:doc};
   }
   async function ocrPageFromPdfDoc(doc,region=null,options={}){
     if(!doc)throw new Error('OCR用PDFドキュメントがありません');
@@ -155,9 +178,16 @@ const FurusatoGoogleDrive = (() => {
     if(!window.Tesseract?.recognize)throw new Error('OCRライブラリを読み込めませんでした');
     const psm=String(options.psm||11);
     const lang=String(options.lang||'jpn+eng');
-    const rOcr=await window.Tesseract.recognize(canvas,lang,{tessedit_pageseg_mode:psm,preserve_interword_spaces:'1'});
+    const sample=ctx.getImageData(0,0,Math.min(cw,64),Math.min(ch,64)).data;
+    let nonWhite=0,sum=0; for(let i=0;i<sample.length;i+=4){const v=(sample[i]+sample[i+1]+sample[i+2])/3;sum+=v;if(v<245)nonWhite++;}
+    // iOS Safari can hand Tesseract a canvas that looks valid but is effectively
+    // unreadable to the worker. Passing an explicit PNG data URL is more stable.
+    const imageDataUrl=canvas.toDataURL('image/png');
+    const rOcr=await window.Tesseract.recognize(imageDataUrl,lang,{tessedit_pageseg_mode:psm,preserve_interword_spaces:'1'});
     const data=rOcr?.data||{};
-    return {text:String(data.text||''),words:Array.isArray(data.words)?data.words:[],pages:[],pageCount:doc.numPages,textItemCount:0,ocrUsed:true,ocrConfidence:Number(data.confidence||0),ocrPsm:psm,ocrLang:lang,ocrWidth:cw,ocrHeight:ch,ocrRegion:!!region};
+    const result={text:String(data.text||''),words:Array.isArray(data.words)?data.words:[],pages:[],pageCount:doc.numPages,textItemCount:0,ocrUsed:true,ocrConfidence:Number(data.confidence||0),ocrPsm:psm,ocrLang:lang,ocrWidth:cw,ocrHeight:ch,ocrRegion:!!region,imageBytes:imageDataUrl.length,cornerNonWhite:nonWhite,cornerMean:sample.length?sum/(sample.length/4):255};
+    diag({stage:'ocr',psm,lang,chars:result.text.length,words:result.words.length,confidence:result.ocrConfidence,width:cw,height:ch,imageBytes:result.imageBytes,cornerNonWhite:result.cornerNonWhite,cornerMean:result.cornerMean,region:!!region,sample:result.text.slice(0,300)});
+    return result;
   }
   function ocrQuality(text,confidence=0){
     const t=String(text||''); const digits=(t.match(/\d/g)||[]).length;
@@ -221,7 +251,7 @@ const FurusatoGoogleDrive = (() => {
         ||nonEmpty.find(x=>!x.ocrRegion&&Array.isArray(x.words)&&x.words.length)
         ||best;
       return {...base,text:mergedText,ocrText:mergedText,ocrUsed:true,ocrConfidence:Math.max(...attempts.map(x=>Number(x.ocrConfidence||0))),ocrPsm:attempts.map(x=>x.ocrPsm).join(','),ocrWords:wordSource.words||[],ocrWordCount:Array.isArray(wordSource.words)?wordSource.words.length:0,ocrWidth:wordSource.ocrWidth,ocrHeight:wordSource.ocrHeight,ocrAttempts:attempts.map(x=>({psm:x.ocrPsm,lang:x.ocrLang,chars:String(x.text||'').length,confidence:x.ocrConfidence||0,words:Array.isArray(x.words)?x.words.length:0,valid:valid.includes(x)})),ocrValidated:valid.length>0};
-    }catch(e){return {...base,text:raw,ocrText:'',ocrUsed:true,ocrError:e?.message||String(e)};}
+    }catch(e){diag({stage:'ocrError',type,name,error:e?.stack||e?.message||String(e),attempts:attempts.map(x=>({psm:x.ocrPsm,lang:x.ocrLang,chars:String(x.text||'').length,confidence:x.ocrConfidence||0,words:Array.isArray(x.words)?x.words.length:0,sample:String(x.text||'').slice(0,300),width:x.ocrWidth||0,height:x.ocrHeight||0,imageBytes:x.imageBytes||0,cornerNonWhite:x.cornerNonWhite||0,cornerMean:x.cornerMean||0}))});return {...base,text:raw,ocrText:'',ocrUsed:true,ocrError:e?.message||String(e),ocrAttempts:attempts.map(x=>({psm:x.ocrPsm,lang:x.ocrLang,chars:String(x.text||'').length,confidence:x.ocrConfidence||0,words:Array.isArray(x.words)?x.words.length:0,valid:false})),ocrValidated:false};}
     return {...base,text:raw,ocrUsed:true,ocrError:'OCR結果が空でした'};
   }
   function classifyPdfText(text,name=''){
@@ -948,7 +978,7 @@ const FurusatoGoogleDrive = (() => {
     state.priorSalaryRecords=(state.priorSalaryRecords||[]).filter(x=>Number(x.year)===priorYear); state.priorBonusRecords=(state.priorBonusRecords||[]).filter(x=>Number(x.year)===priorYear); state.priorSocialRecords=(state.priorSocialRecords||[]).filter(x=>Number(x.year)===priorYear);
     for(const f of files){
       try{
-        onProgress?.(`解析中: ${f.name}`); const buf=await downloadPdf(f.id); let pdf=await pdfText(buf); pdf=await ensurePdfText(buf,pdf,f.name); const text=pdf.text,detectedType=classifyPdfText(text,f.name),type=detectedType==='unknown' ? ({salary:'salary_slip',bonus:'bonus_slip',withholding:'withholding'}[f.candidateType]||detectedType) : detectedType; const detail={name:f.name,id:f.id,type:f.candidateType,filenameYear:f.filenameYear||null,detectedType:type,textChars:String(text||'').length,textItemCount:pdf.textItemCount||0,ocrUsed:!!pdf.ocrUsed,ocrConfidence:pdf.ocrConfidence||0,ocrError:pdf.ocrError||'',ocrWordCount:pdf.ocrWordCount||0,ocrValidated:!!pdf.ocrValidated,ocrAttempts:pdf.ocrAttempts||[]}; state.importFileDetails.push(detail);
+        onProgress?.(`解析中: ${f.name}`); const buf=await downloadPdf(f.id); let pdf=await pdfText(buf); pdf=await ensurePdfText(buf,pdf,f.name); const text=pdf.text,detectedType=classifyPdfText(text,f.name),type=detectedType==='unknown' ? ({salary:'salary_slip',bonus:'bonus_slip',withholding:'withholding'}[f.candidateType]||detectedType) : detectedType; const detail={name:f.name,id:f.id,type:f.candidateType,filenameYear:f.filenameYear||null,detectedType:type,textChars:String(text||'').length,textItemCount:pdf.textItemCount||0,ocrUsed:!!pdf.ocrUsed,ocrConfidence:pdf.ocrConfidence||0,ocrError:pdf.ocrError||'',ocrWordCount:pdf.ocrWordCount||0,ocrValidated:!!pdf.ocrValidated,ocrAttempts:pdf.ocrAttempts||[],pageCount:pdf.pageCount||0,pageMeta:pdf.pageMeta||[],ocrWidth:pdf.ocrWidth||0,ocrHeight:pdf.ocrHeight||0,ocrImageBytes:pdf.imageBytes||0,ocrCornerNonWhite:pdf.cornerNonWhite||0,ocrCornerMean:pdf.cornerMean||0}; state.importFileDetails.push(detail);
         if(type==='salary_slip'){
           const x=parseSalaryPdf(pdf,f.name); Object.assign(detail,{year:x.year||null,month:x.month||null,gross:x.gross||0,taxableGross:x.taxableGross||0,grossTotal:x.grossTotal||0,nonTaxableTotal:x.nonTaxableTotal||0,social:x.social||0,components:x.components||{},socialComponents:x.socialComponents||{},needsReview:!!x.needsReview}); x.ocrUsed=!!pdf.ocrUsed; if(x.ocrUsed)result.salaryOcr++; x.ocrConfidence=pdf.ocrConfidence||0; x.textItemCount=pdf.textItemCount||0; x.textChars=String(pdf.text||'').length; x.ocrError=pdf.ocrError||''; const inScope=[targetYear,priorYear].includes(Number(x.year));
           if(!inScope){result.skipped++; recordHistory(state,{at:new Date().toISOString(),name:f.name,type:'salary',year:x.year||f.filenameYear||null,status:'対象外',reason:'対象年/前年ではない'});continue}
@@ -965,10 +995,10 @@ const FurusatoGoogleDrive = (() => {
         }else {result.skipped++;state.importHistory.unshift({at:new Date().toISOString(),name:f.name,type:type||f.candidateType||'other',year:f.filenameYear||null,status:'対象外'});}
       }catch(e){result.errors.push(`${f.name}: ${e.message}`);recordHistory(state,{at:new Date().toISOString(),name:f.name,type:f.candidateType||'other',year:f.filenameYear||null,status:'エラー',reason:e.message});}
     }
-    rebuildPriorSummary(state,priorYear); buildForecastFromPrior(state,targetYear,Number(state.actualThrough||9)); state.importDiagnostics={at:new Date().toISOString(),targetYear,files:result.files,salaryCandidates:result.salaryCandidates,salaryImported:result.salaryImported,salaryParsed:result.salaryParsed,salaryOcr:result.salaryOcr,salaryRejected:result.salaryRejected,errors:result.errors.slice(),fileDetails:state.importFileDetails||[]}; state.importHistory=state.importHistory.filter(x=>{if(!String(x?.name||'').startsWith(TARGET_FILE_PREFIX))return true;const y=Number(x?.year||0);return !y||y===targetYear||y===priorYear}).slice(0,200); state.importSettings={...(state.importSettings||{}),targetYear,priorYear};
+    rebuildPriorSummary(state,priorYear); buildForecastFromPrior(state,targetYear,Number(state.actualThrough||9)); state.importDiagnostics={at:new Date().toISOString(),targetYear,files:result.files,salaryCandidates:result.salaryCandidates,salaryImported:result.salaryImported,salaryParsed:result.salaryParsed,salaryOcr:result.salaryOcr,salaryRejected:result.salaryRejected,errors:result.errors.slice(),fileDetails:state.importFileDetails||[],runtimeReadout:runtimeDiagnostics.slice()}; state.importHistory=state.importHistory.filter(x=>{if(!String(x?.name||'').startsWith(TARGET_FILE_PREFIX))return true;const y=Number(x?.year||0);return !y||y===targetYear||y===priorYear}).slice(0,200); state.importSettings={...(state.importSettings||{}),targetYear,priorYear};
     return result;
   }
-  return {CLIENT_KEY,getClientId,setClientId,ready,authorize,signOut,listCandidateFiles,scanAndImport,classifyPdfText,parseSalaryPdf,parseBonusPdf,parseWithholdingPdf,extractLabeledNumber,extractToyotaPayrollAmount,extractExactYenAfterLabel,upsertSalaryRecord,upsertBonusRecord,ensurePdfText};
+  return {CLIENT_KEY,getClientId,setClientId,ready,authorize,signOut,listCandidateFiles,scanAndImport,classifyPdfText,parseSalaryPdf,parseBonusPdf,parseWithholdingPdf,extractLabeledNumber,extractToyotaPayrollAmount,extractExactYenAfterLabel,upsertSalaryRecord,upsertBonusRecord,ensurePdfText,getRuntimeDiagnostics,clearRuntimeDiagnostics};
 })();
 if(typeof window!=='undefined')window.FurusatoGoogleDrive=FurusatoGoogleDrive;
 if(typeof module!=='undefined')module.exports={FurusatoImport,FurusatoGoogleDrive};
