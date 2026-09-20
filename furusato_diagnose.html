@@ -1,0 +1,184 @@
+<!doctype html>
+<html lang="ja">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1,viewport-fit=cover">
+<title>ふるさと納税アプリ 診断</title>
+<style>
+body{font-family:-apple-system,BlinkMacSystemFont,"Hiragino Sans",sans-serif;margin:0;background:#f3f4f6;color:#111827}
+.wrap{max-width:900px;margin:auto;padding:16px}
+.card{background:#fff;border-radius:16px;padding:16px;margin:12px 0;box-shadow:0 2px 10px #0001}
+h1{font-size:22px;margin:0 0 8px}.muted{color:#6b7280;font-size:13px}
+button{font:inherit;padding:11px 14px;border:0;border-radius:10px;background:#111827;color:white;margin:4px 4px 4px 0}
+pre{white-space:pre-wrap;word-break:break-word;background:#111827;color:#f9fafb;border-radius:10px;padding:12px;font-size:12px;max-height:360px;overflow:auto}
+.ok{color:#047857}.bad{color:#b91c1c}.warn{color:#b45309}
+iframe{width:100%;height:560px;border:1px solid #d1d5db;border-radius:12px;background:#fff}
+table{width:100%;border-collapse:collapse;font-size:13px}td,th{padding:7px;border-bottom:1px solid #e5e7eb;text-align:left;vertical-align:top}
+</style>
+</head>
+<body>
+<div class="wrap">
+<h1>🔎 ふるさと納税アプリ 診断</h1>
+<div class="muted">これは本体を修正するファイルではありません。原因を切り分けるための一時診断ページです。</div>
+
+<div class="card">
+  <b>最初にやること</b>
+  <ol>
+    <li>このページを GitHub Pages に置く。</li>
+    <li>下の「settings.htmlを読み込む」を押す。</li>
+    <li>表示された設定画面で、前に反応しなかった画像・ボタンを実際にタップする。</li>
+    <li>「診断結果をコピー」を押して、その結果をこのチャットに貼る。</li>
+  </ol>
+  <button id="load">settings.htmlを読み込む</button>
+  <button id="run">もう一度診断</button>
+  <button id="copy">診断結果をコピー</button>
+</div>
+
+<div class="card">
+<h2>自動診断</h2>
+<div id="summary">まだ実行していません。</div>
+<table><tbody id="checks"></tbody></table>
+</div>
+
+<div class="card">
+<h2>設定画面でのクリック診断</h2>
+<div class="muted">下の画面内をタップすると、タップされた要素を記録します。「反応しない画像」もここでタップしてください。</div>
+<div id="last">タップ待ち…</div>
+<iframe id="frame" title="settings.html"></iframe>
+</div>
+
+<div class="card">
+<h2>詳細ログ</h2>
+<pre id="log">ログなし</pre>
+</div>
+</div>
+
+<script>
+(function(){
+  const $=id=>document.getElementById(id);
+  const results=[];
+  const logs=[];
+  let frameWin=null, frameDoc=null;
+
+  function add(name,status,detail){
+    results.push({name,status,detail:String(detail??'')});
+    render();
+  }
+  function log(s){logs.push(new Date().toISOString()+" "+s);$("log").textContent=logs.join("\n");}
+  function render(){
+    const good=results.filter(x=>x.status==="OK").length;
+    const bad=results.filter(x=>x.status==="NG").length;
+    const warn=results.filter(x=>x.status==="WARN").length;
+    $("summary").innerHTML=`<b>${bad?"要確認":"診断実行中/大きな異常なし"}</b>　OK ${good} / WARN ${warn} / NG ${bad}`;
+    $("checks").innerHTML=results.map(x=>`<tr><th>${esc(x.name)}</th><td class="${x.status==="OK"?"ok":x.status==="NG"?"bad":"warn"}">${x.status}</td><td>${esc(x.detail)}</td></tr>`).join("");
+  }
+  function esc(v){return String(v).replace(/[&<>"]/g,m=>({"&":"&amp;","<":"&lt;",">":"&gt;","\"":"&quot;"}[m]));}
+
+  async function check(){
+    results.length=0; logs.length=0;
+    log("diagnostic start");
+    add("JavaScript","OK","診断ページのJavaScriptは実行されています。");
+    add("現在URL","OK",location.href);
+    add("オンライン","navigator.onLine?"OK":"WARN",navigator.onLine?"online":"offline");
+
+    try{
+      const regs=await navigator.serviceWorker?.getRegistrations();
+      add("Service Worker",regs&&regs.length?"WARN":"OK",regs&&regs.length?regs.map(r=>r.scope).join(" / "):"登録なし");
+    }catch(e){add("Service Worker","WARN",e.message)}
+
+    try{
+      const keys=[];
+      for(let i=0;i<localStorage.length;i++)keys.push(localStorage.key(i));
+      add("localStorage","OK",keys.length+" keys; furusatoState="+(keys.includes("furusatoState")?"あり":"なし"));
+    }catch(e){add("localStorage","NG",e.message)}
+
+    for(const p of ["settings.html","integration.js","index.html","manifest.json"]){
+      try{
+        const r=await fetch(p+"?diagnose="+Date.now(),{cache:"no-store"});
+        add("ファイル: "+p,r.ok?"OK":"NG",r.status+" "+r.statusText);
+      }catch(e){add("ファイル: "+p,"NG",e.message)}
+    }
+
+    try{
+      const r=await fetch("integration.js?diagnose="+Date.now(),{cache:"no-store"});
+      const t=await r.text();
+      add("integration.js内容","OK",t.length+" bytes; ensurePdfText="+(t.includes("ensurePdfText")?"あり":"なし"));
+    }catch(e){add("integration.js内容","NG",e.message)}
+
+    log("diagnostic complete");
+  }
+
+  function attachFrame(){
+    const f=$("frame");
+    f.addEventListener("load",()=>{
+      try{
+        frameWin=f.contentWindow; frameDoc=f.contentDocument;
+        add("settings.html 読み込み","OK","同一オリジンとしてDOMを検査できます。");
+        const els=[...frameDoc.querySelectorAll("button,input,img,a,[role=button],[onclick]")];
+        add("設定画面の操作候補","OK",els.length+" 個の要素を検出");
+        const scripts=[...frameDoc.scripts].map(s=>s.src||"inline");
+        log("scripts: "+scripts.join(" | "));
+
+        frameWin.addEventListener("error",e=>{
+          log("FRAME ERROR: "+(e.message||"unknown")+" @ "+(e.filename||"")+" : "+(e.lineno||""));
+          add("settings.html JavaScript error","NG",(e.message||"unknown")+" @ "+(e.filename||"")+" : "+(e.lineno||""));
+        });
+        frameWin.addEventListener("unhandledrejection",e=>{
+          log("FRAME PROMISE ERROR: "+String(e.reason));
+          add("settings.html Promise error","NG",String(e.reason));
+        });
+
+        frameDoc.addEventListener("click",ev=>{
+          const t=ev.target;
+          const info={
+            tag:t?.tagName,
+            id:t?.id,
+            cls:t?.className,
+            text:(t?.innerText||t?.alt||"").trim().slice(0,120),
+            href:t?.closest?.("a")?.href||"",
+            disabled:!!t?.disabled,
+            pointerEvents:frameWin.getComputedStyle(t).pointerEvents,
+            zIndex:frameWin.getComputedStyle(t).zIndex
+          };
+          $("last").innerHTML="<b>最後のタップ:</b><br><pre>"+esc(JSON.stringify(info,null,2))+"</pre>";
+          log("FRAME CLICK "+JSON.stringify(info));
+        },true);
+
+        [...frameDoc.querySelectorAll("button,input,img,a,[role=button],[onclick]")].forEach((el,i)=>{
+          el.addEventListener("click",()=>{
+            log("handler observed #"+i+" "+el.tagName+" "+el.id);
+          },true);
+        });
+      }catch(e){
+        add("settings.html DOM検査","NG",e.message);
+        log("attachFrame error: "+e.stack);
+      }
+    });
+  }
+
+  $("load").onclick=()=>{ $("frame").src="settings.html?diagnose="+Date.now(); };
+  $("run").onclick=check;
+  $("copy").onclick=async()=>{
+    const report={
+      generatedAt:new Date().toISOString(),
+      page:location.href,
+      results,
+      lastTap:$("last").innerText,
+      logs
+    };
+    const text=JSON.stringify(report,null,2);
+    try{
+      await navigator.clipboard.writeText(text);
+      $("copy").textContent="コピーしました";
+      setTimeout(()=>$("copy").textContent="診断結果をコピー",1500);
+    }catch(e){
+      prompt("コピーできませんでした。以下をコピーしてください。",text);
+    }
+  };
+
+  attachFrame();
+  check();
+})();
+</script>
+</body>
+</html>
