@@ -1,5 +1,13 @@
-const CACHE='furusato-manager-2026-09-20-fix5';
-const ASSETS=['./','./index.html','./settings.html','./integration.js','./app.js','./style.css','./manifest.json'];
+const CACHE='furusato-manager-2026-09-20-fix6';
+const ASSETS=[
+  './',
+  './index.html',
+  './settings.html',
+  './integration.js',
+  './app.js',
+  './style.css',
+  './manifest.json'
+];
 self.addEventListener('install',event=>{
   event.waitUntil(caches.open(CACHE).then(c=>c.addAll(ASSETS)).then(()=>self.skipWaiting()));
 });
@@ -11,5 +19,11 @@ self.addEventListener('fetch',event=>{
   if(req.method!=='GET')return;
   const url=new URL(req.url);
   if(url.origin!==location.origin)return;
-  event.respondWith(caches.match(req).then(cached=>cached||fetch(req).then(res=>{const copy=res.clone();caches.open(CACHE).then(c=>c.put(req,copy)).catch(()=>{});return res;}).catch(()=>cached)));
+  event.respondWith(
+    caches.match(req).then(cached=>cached||fetch(req).then(res=>{
+      const copy=res.clone();
+      caches.open(CACHE).then(c=>c.put(req,copy)).catch(()=>{});
+      return res;
+    }).catch(()=>cached))
+  );
 });
