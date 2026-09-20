@@ -80,7 +80,7 @@ const FurusatoModel = (() => {
             // The main state is authoritative. The payroll store is a recovery
             // copy, not a second source that may overwrite newer data with an
             // older/empty snapshot when navigating between pages.
-            for(const k of ['salaryRecords','socialRecords','forecastSalary','forecastSocial','bonusRecords','bonusSocialRecords','forecastBonus','priorSalaryRecords','priorSocialRecords','priorBonusRecords','prior','sourceDocuments','importScanCandidates','importDiagnostics','importSettings']){
+            for(const k of ['salaryRecords','socialRecords','forecastSalary','forecastSocial','bonusRecords','bonusSocialRecords','forecastBonus','priorSalaryRecords','priorSocialRecords','priorBonusRecords','prior','sourceDocuments','importScanCandidates','importFileDetails','importDiagnostics','importSettings']){
               if((s[k]===undefined || (Array.isArray(s[k])&&s[k].length===0)) && store[k]!==undefined)s[k]=clone(store[k]);
             }
           }
@@ -101,7 +101,7 @@ const FurusatoModel = (() => {
     safeWrite('furusatoState',json);
     safeWrite(IMPORT_HISTORY_KEY,JSON.stringify(h));
     const payrollStore={};
-    for(const k of ['salaryRecords','socialRecords','forecastSalary','forecastSocial','bonusRecords','bonusSocialRecords','forecastBonus','priorSalaryRecords','priorSocialRecords','priorBonusRecords','prior','sourceDocuments','importScanCandidates','importDiagnostics','importSettings'])payrollStore[k]=n[k];
+    for(const k of ['salaryRecords','socialRecords','forecastSalary','forecastSocial','bonusRecords','bonusSocialRecords','forecastBonus','priorSalaryRecords','priorSocialRecords','priorBonusRecords','prior','sourceDocuments','importScanCandidates','importFileDetails','importDiagnostics','importSettings'])payrollStore[k]=n[k];
     safeWrite(PAYROLL_STORE_KEY,JSON.stringify(payrollStore));
     return n;
   }

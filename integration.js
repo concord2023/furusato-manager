@@ -62,7 +62,7 @@ const FurusatoGoogleDrive = (() => {
   function yearFromName(name=''){
     const n=String(name);
     let m=n.match(/(20\d{2})[-_](0[1-9]|1[0-2])(?:[-_]\d{1,2})?/); if(m)return Number(m[1]);
-    m=n.match(/(20\d{2})(0[1-9]|1[0-2])(?!\d)/); if(m)return Number(m[1]);
+    m=n.match(/(20\d{2})(0[1-9]|1[0-2])(?![\d,])/); if(m)return Number(m[1]);
     m=n.match(/(20\d{2})年/); if(m)return Number(m[1]);
     m=n.match(/(?:R|令和)\s*0?(\d{1,2})年/i); if(m)return 2018+Number(m[1]);
     return null;
@@ -125,7 +125,14 @@ const FurusatoGoogleDrive = (() => {
       for(let i=1;i<=doc.numPages;i++){
         const page=await doc.getPage(i); const c=await page.getTextContent();
         const items=(c.items||[]).filter(x=>String(x.str||'').trim()).map(x=>({str:String(x.str||''),x:Number(x.transform?.[4]||0),y:Number(x.transform?.[5]||0),width:Number(x.width||0),height:Number(x.height||0)}));
-        pages.push(items); text+=items.map(x=>x.str).join(' ')+'\n';
+        pages.push(items);
+        // Preserve visual rows in the text representation. A flat stream loses
+        // the table columns of Japanese payroll/withholding forms and causes a
+        // label to accidentally consume a number from another column.
+        const lines=[];
+        for(const it of items){let g=lines.find(v=>Math.abs(v.y-it.y)<=3);if(!g){g={y:it.y,items:[]};lines.push(g)}g.items.push(it)}
+        lines.sort((a,b)=>b.y-a.y);
+        text+=lines.map(g=>g.items.slice().sort((a,b)=>a.x-b.x).map(x=>x.str).join(' ')).join('\n')+'\n';
       }
       return {text,pages,pageCount:doc.numPages,textItemCount:pages.reduce((a,p)=>a+p.length,0),ocrUsed:false,pdfDoc:doc};
     }finally{URL.revokeObjectURL(url)}
@@ -196,10 +203,10 @@ const FurusatoGoogleDrive = (() => {
   function extractNumberAfter(text,patterns){const s=cleanPdfText(text);for(const p of patterns){const m=s.match(p);if(m)return Number(String(m[1]).replace(/,/g,''))}return null}
   function extractDateParts(text,name=''){
     const s=`${name}\n${text}`; let m=String(name).match(/(20\d{2})[-_](0[1-9]|1[0-2])(?:[-_]\d{1,2})?/); if(m)return {year:Number(m[1]),month:Number(m[2])};
-    m=String(name).match(/(20\d{2})(0[1-9]|1[0-2])(?!\d)/); if(m)return {year:Number(m[1]),month:Number(m[2])};
+    m=String(name).match(/(20\d{2})(0[1-9]|1[0-2])(?![\d,])/); if(m)return {year:Number(m[1]),month:Number(m[2])};
     m=s.match(/(20\d{2})年\s*(\d{1,2})月/); if(m)return {year:Number(m[1]),month:Number(m[2])};
     m=s.match(/(20\d{2})[/-](\d{1,2})(?:[/-]\d{1,2})?/); if(m)return {year:Number(m[1]),month:Number(m[2])};
-    m=s.match(/(20\d{2})(0[1-9]|1[0-2])(?!\d)/); if(m)return {year:Number(m[1]),month:Number(m[2])};
+    m=s.match(/(20\d{2})(0[1-9]|1[0-2])(?![\d,])/); if(m)return {year:Number(m[1]),month:Number(m[2])};
     return {year:null,month:null};
   }
   function normalizeLabel(s){return String(s||'').replace(/[\u3000\s]/g,'').replace(/[（）()]/g,'').toLowerCase()}
@@ -400,34 +407,54 @@ const FurusatoGoogleDrive = (() => {
     }
     return null;
   }
+  function extractExactYenAfterLabel(textOrPdf, labels){
+    const raw=typeof textOrPdf==='string'?textOrPdf:(textOrPdf?.text||'');
+    const normalize=(v)=>String(v||'').replace(/[\u3000()（）]/g,'').replace(/−/g,'-');
+    const source=normalize(raw);
+    for(const label of (labels||[])){
+      const l=normalize(label); if(!l)continue;
+      let from=0;
+      while(true){
+        const idx=source.indexOf(l,from); if(idx<0)break;
+        const tail=source.slice(idx+l.length,idx+l.length+300);
+        const matches=[...tail.matchAll(/((?:\d{1,3}(?:,\d{3})+|\d{3,}))(?![\d,])/g)];
+        for(const m of matches){
+          const n=Number(m[1].replace(/,/g,''));
+          if(!Number.isFinite(n)||n<100||n>=1000000000||(n>=1900&&n<=2100))continue;
+          if(m.index>260)continue;
+          return n;
+        }
+        from=idx+l.length;
+      }
+    }
+    return null;
+  }
   function parseSalaryComponents(text){
     const s=cleanPdfText(typeof text==='string'?text:text?.text||'');
-    const taxableAmount=extractToyotaPayrollAmount(text,['課税対象額','Taxable Amount','課税支給額','Taxable Pay']);
-    const grossTotal=extractToyotaPayrollAmount(text,['支給合計 (A)','支給合計（A)','支給合計','Total Payment','総支給額']);
-    const nonTaxableTotal=extractToyotaPayrollAmount(text,['内 通勤補助費等非課税分','内通勤補助費等非課税分','Non-taxable Amount']);
+    // Structured summary fields are authoritative. Parse them by exact label,
+    // not by visual-nearest-number heuristics: the slip contains many other
+    // amounts (bank transfers, standard remuneration, deductions, etc.).
+    const grossTotal=extractExactYenAfterLabel(text,['支給合計（A)','支給合計(A)','Total Payment']);
+    const nonTaxableTotal=extractExactYenAfterLabel(text,['（内通勤補助費等非課税分)','(内通勤補助費等非課税分)','Non-taxable Amount']);
+    const explicitTaxable=extractExactYenAfterLabel(text,['課税対象額','Taxable Amount']);
+    const derivedTaxable=(grossTotal!=null&&nonTaxableTotal!=null&&grossTotal>=nonTaxableTotal)?grossTotal-nonTaxableTotal:null;
+    const taxableBase=derivedTaxable!=null?derivedTaxable:(explicitTaxable!=null?explicitTaxable:null);
     const socialLabels={
       employmentInsurance:['雇用保険料'],
-      healthInsurance:['健康保険料（基本','健康保険料 (基本','健康保険料（基本）'],
-      healthInsuranceSpecial:['健康保険料（特定','健康保険料 (特定','健康保険料（特定）'],
+      healthInsurance:['健康保険料（基本）','健康保険料 (基本)'],
+      healthInsuranceSpecial:['健康保険料（特定）','健康保険料 (特定)'],
       nursingCare:['介護保険料'],
       childSupport:['子ども・子育て支援金'],
       pension:['年金保険料','厚生年金保険料']
     };
     const socialComponents={};
-    for(const [k,labels] of Object.entries(socialLabels)) socialComponents[k]=extractLabeledNumber(text,labels);
-    const socialKnown=Object.values(socialComponents).filter(v=>Number.isFinite(v));
-    const socialTotal=socialKnown.length===Object.keys(socialComponents).length?socialKnown.reduce((a,v)=>a+v,0):null;
-    const derivedTaxable=(grossTotal!=null&&nonTaxableTotal!=null&&grossTotal>=nonTaxableTotal)?grossTotal-nonTaxableTotal:null;
-    // Toyota's slip explicitly gives Total Payment and the non-taxable portion.
-    // That arithmetic is more reliable than a text-layer match because the
-    // English phrase "Taxable Amount" can occur inside "Non-taxable Amount".
-    // When both totals are available, use the derived tax base and retain the
-    // label-derived value only as diagnostic information.
-    const taxableBase=derivedTaxable!=null?derivedTaxable:(taxableAmount!=null?taxableAmount:null);
+    for(const [k,labels] of Object.entries(socialLabels)) socialComponents[k]=extractExactYenAfterLabel(text,labels);
+    const socialValues=Object.values(socialComponents);
+    const socialTotal=socialValues.every(v=>Number.isFinite(v))?socialValues.reduce((a,v)=>a+v,0):null;
     const grossComponents=[];
-    const base=extractLabeledNumber(text,['基準賃金等','基本給']);
-    const commuting=extractLabeledNumber(text,['通勤費補助','通勤手当']);
-    const stockSubsidy=extractLabeledNumber(text,['持株会補助手当','持株会補助']);
+    const base=extractExactYenAfterLabel(text,['基準賃金等']);
+    const commuting=extractExactYenAfterLabel(text,['通勤費補助']);
+    const stockSubsidy=extractExactYenAfterLabel(text,['持株会補助手当']);
     if(base!=null)grossComponents.push({label:'基準賃金等',amount:base,taxTreatment:'taxable',source:'explicit'});
     if(commuting!=null){
       const nonTaxable=nonTaxableTotal!=null?Math.min(commuting,nonTaxableTotal):null;
@@ -436,8 +463,12 @@ const FurusatoGoogleDrive = (() => {
     }
     if(stockSubsidy!=null)grossComponents.push({label:'持株会補助手当',amount:stockSubsidy,taxTreatment:'taxable',source:'explicit'});
     const unknown=[];
-    if(taxableBase==null) unknown.push('課税対象額');
-    return {grossTotal,taxableGross:taxableBase,nonTaxableTotal,socialComponents,socialTotal,grossComponents,unknownComponents:unknown,needsReview:taxableBase==null||socialTotal==null};
+    if(grossTotal==null)unknown.push('支給合計');
+    if(nonTaxableTotal==null)unknown.push('非課税分');
+    if(taxableBase==null)unknown.push('課税対象額');
+    if(socialTotal==null)unknown.push('社会保険料');
+    const arithmeticOk=derivedTaxable!=null&&explicitTaxable!=null&&derivedTaxable===explicitTaxable;
+    return {grossTotal,taxableGross:taxableBase,explicitTaxableGross:explicitTaxable,nonTaxableTotal,socialComponents,socialTotal,grossComponents,unknownComponents:unknown,arithmeticOk,needsReview:unknown.length>0||!arithmeticOk};
   }
   function parseSalaryPdf(text,name){
     const raw=typeof text==='string'?text:(text?.text||'');
@@ -461,13 +492,13 @@ const FurusatoGoogleDrive = (() => {
     }
     const taxableGross=Number.isFinite(c.taxableGross)&&c.taxableGross>0?c.taxableGross:null;
     const grossTotal=Number.isFinite(c.grossTotal)&&c.grossTotal>0?c.grossTotal:null;
-    return {year:d.year,month:d.month,gross:taxableGross,taxableGross,grossTotal,nonTaxableTotal:c.nonTaxableTotal,social:c.socialTotal,socialComponents:c.socialComponents,components:c.grossComponents,unknownComponents:c.unknownComponents,source:'google-drive',status:'actual',document:name,needsReview:taxableGross==null||c.socialTotal==null};
+    return {year:d.year,month:d.month,gross:taxableGross,taxableGross,grossTotal,nonTaxableTotal:c.nonTaxableTotal,social:c.socialTotal,socialComponents:c.socialComponents,components:c.grossComponents,unknownComponents:c.unknownComponents,source:'google-drive',status:'actual',document:name,needsReview:!!c.needsReview};
   }
   function filenameDateFallback(name){
     const n=String(name||'');
     let m=n.match(/(20\d{2})[-_](0[1-9]|1[0-2])(?:[-_]\d{1,2})?/);
     if(m)return {year:Number(m[1]),month:Number(m[2])};
-    m=n.match(/(20\d{2})(0[1-9]|1[0-2])(?!\d)/);
+    m=n.match(/(20\d{2})(0[1-9]|1[0-2])(?![\d,])/);
     return m?{year:Number(m[1]),month:Number(m[2])}:{year:null,month:null};
   }
   function mergeDateFallback(parsed,name){
@@ -486,20 +517,122 @@ const FurusatoGoogleDrive = (() => {
     const s=String(typeof textOrPdf==='string'?textOrPdf:textOrPdf?.text||'');
     const m=s.match(/厚生年金保険\s*[（(]150万\/回[）)][\s\S]{0,500}Welfare Pension Insurance/i); if(!m)return null; const nums=(m[0].match(/\d[\d,]*/g)||[]).map(v=>Number(v.replace(/,/g,''))).filter(v=>v>=100); return nums.length?nums[nums.length-1]:null;
   }
+  function extractNthAmountAfterLabel(textOrPdf, labels, ordinal=1){
+    const raw=typeof textOrPdf==='string'?textOrPdf:(textOrPdf?.text||'');
+    const normalize=v=>String(v||'').replace(/[\u3000()（）]/g,'').replace(/−/g,'-');
+    const source=normalize(raw);
+    for(const label of (labels||[])){
+      const l=normalize(label); let from=0;
+      while(true){
+        const i=source.indexOf(l,from); if(i<0)break;
+        const tail=source.slice(i+l.length,i+l.length+120);
+        const vals=[];
+        for(const m of tail.matchAll(/((?:\d{1,3}(?:,\d{3})+|\d{3,}))(?![\d,])/g)){
+          const n=Number(m[1].replace(/,/g,''));
+          if(Number.isFinite(n)&&n>=100&&n<1000000000&&(n<1900||n>2100))vals.push(n);
+          if(vals.length>=ordinal)return vals[ordinal-1];
+        }
+        from=i+l.length;
+      }
+    }
+    return null;
+  }
+  function extractThousandAfterLabel(textOrPdf, labels){
+    const raw=typeof textOrPdf==='string'?textOrPdf:(textOrPdf?.text||'');
+    const normalize=v=>String(v||'').replace(/[\u3000()（）]/g,'').replace(/−/g,'-');
+    const source=normalize(raw);
+    for(const label of (labels||[])){
+      const l=normalize(label); let from=0;
+      while(true){
+        const i=source.indexOf(l,from); if(i<0)break;
+        const tail=source.slice(i+l.length,i+l.length+300);
+        for(const m of tail.matchAll(/((?:\d{1,3}(?:,\d{3})+|\d{3,}))(?![\d,])/g)){
+          const n=Number(m[1].replace(/,/g,''));
+          if(n>=100&&n<=10000)return n;
+        }
+        from=i+l.length;
+      }
+    }
+    return null;
+  }
   function parseBonusPdf(text,name){
-    const raw=typeof text==='string'?text:(text?.text||''); const d=extractDateParts(raw,name),s=cleanPdfText(raw);
-    const amount=extractLabeledNumber(text,['支給合計 (A)','支給合計（A)','Total Payment','支給額']);
-    const taxableGross=extractLabeledNumber(text,['課税対象額','Taxable Amount']);
-    const socialLabels={employmentInsurance:['雇用保険料'],healthInsurance:['健康保険料（基本','健康保険料 (基本'],healthInsuranceSpecial:['健康保険料（特定','健康保険料 (特定'],nursingCare:['介護保険料'],childSupport:['子ども・子育て支援金'],pension:['年金保険料','厚生年金保険料']};
-    const socialComponents={}; for(const [k,labels] of Object.entries(socialLabels)) socialComponents[k]=extractLabeledNumber(text,labels);
-    const socialValues=Object.values(socialComponents).filter(v=>Number.isFinite(v)); const social=socialValues.length===Object.keys(socialComponents).length?socialValues.reduce((a,v)=>a+v,0):null;
-    const standardHealth=extractStandardBonusHealth(text);
-    const standardPension=extractStandardBonusPension(text);
+    const raw=typeof text==='string'?text:(text?.text||'');
+    const d=extractDateParts(raw,name);
+    // Prefer the explicit yen-denominated payment field. Never use 標準賞与額
+    // (千円) as the payment amount; this was the source of the 5,550,000→5,550 bug.
+    const amount=extractExactYenAfterLabel(text,['支給額','支給合計（A)','支給合計(A)','Total Payment']);
+    const taxableGross=extractExactYenAfterLabel(text,['課税対象額','Taxable Amount']) ?? amount;
+    const socialLabels={employmentInsurance:['雇用保険料'],healthInsurance:['健康保険料（基本）','健康保険料 (基本)'],healthInsuranceSpecial:['健康保険料（特定）','健康保険料 (特定)'],nursingCare:['介護保険料'],childSupport:['子ども・子育て支援金'],pension:['年金保険料','厚生年金保険料']};
+    const socialComponents={}; for(const [k,labels] of Object.entries(socialLabels)) socialComponents[k]=extractExactYenAfterLabel(text,labels);
+    const socialValues=Object.values(socialComponents); const social=socialValues.every(v=>Number.isFinite(v))?socialValues.reduce((a,v)=>a+v,0):null;
+    const standardHealth=extractThousandAfterLabel(text,['健康保険/介護保険']); const standardPension=extractThousandAfterLabel(text,['厚生年金保険（150万/回）','厚生年金保険 (150万/回)']);
+    const deduction=extractExactYenAfterLabel(text,['控除合計（B)','控除合計(B)','Total Deduction']);
+    const net=extractNthAmountAfterLabel(text,['差引支給額（A−B)','差引支給額(A−B)','Net Payment Amount'],2);
+    const derivedNet=(amount!=null&&deduction!=null)?amount-deduction:null;
+    const arithmeticOk=amount!=null&&deduction!=null&&derivedNet>=0&&(net==null||net===derivedNet);
+    const finalNet=derivedNet!=null?derivedNet:net;
     const date=d.year&&d.month?`${d.year}-${String(d.month).padStart(2,'0')}`:'';
-    return {year:d.year,month:d.month,date,amount,taxableGross:taxableGross||amount,social,socialComponents,standardBonusHealth:standardHealth!=null?standardHealth*1000:null,standardBonusPension:standardPension!=null?standardPension*1000:null,source:'google-drive',status:'actual',document:name,needsReview:!(date&&amount)||social==null};
+    return {year:d.year,month:d.month,date,amount,taxableGross,social,socialComponents,standardBonusHealth:standardHealth!=null?standardHealth*1000:null,standardBonusPension:standardPension!=null?standardPension*1000:null,deductionTotal:deduction,netPayment:finalNet,explicitNetPayment:net,source:'google-drive',status:'actual',document:name,arithmeticOk,needsReview:!(date&&amount&&arithmeticOk)||social==null};
+  }
+  function extractLabeledNumberByLayout(textOrPdf, label){
+    const pages=textOrPdf?.pages; if(!Array.isArray(pages))return null;
+    const norm=v=>String(v||'').replace(/[\u3000\s()（）]/g,'');
+    const wanted=norm(label); if(!wanted)return null;
+    for(const page of pages){
+      const items=(page||[]).filter(it=>String(it.str||'').trim()).map(it=>({...it,str:String(it.str||'').trim()}));
+      const nums=items.map(it=>({...it,n:Number(String(it.str).replace(/[￥¥,]/g,''))})).filter(it=>Number.isFinite(it.n)&&it.n>=1000&&it.n<1000000000);
+      for(let i=0;i<items.length;i++){
+        const it=items[i];
+        if(!norm(it.str).includes(wanted))continue;
+        const lx=Number(it.x||0)+Number(it.width||0)/2, ly=Number(it.y||0);
+        const preferRight=/調整控除額|基礎控除の額/.test(wanted);
+        const candidates=nums.filter(n=>{
+          const nx=n.x+n.width/2, ny=n.y;
+          const dx=Math.abs(nx-lx), dy=Math.abs(ny-ly);
+          return dx<=85 && dy>=0 && dy<=55 && (!preferRight || nx>=lx-2);
+        }).sort((a,b)=>{
+          const sa=Math.abs((a.x+a.width/2)-lx)+Math.abs(a.y-ly)*2;
+          const sb=Math.abs((b.x+b.width/2)-lx)+Math.abs(b.y-ly)*2;
+          return sa-sb;
+        });
+        if(candidates.length)return candidates[0].n;
+      }
+    }
+    return null;
   }
   function parseWithholdingPdf(text,name){
-    const raw=typeof text==='string'?text:(text?.text||''); const d=extractDateParts(raw,name),s=cleanPdfText(raw); const annualSalary=extractNumberAfter(s,[/(?:支払金額|給与等の支払金額|支払金額\s*\(a\))\s*[^\d]{0,60}([\d,]{5,})/i]); const social=extractNumberAfter(s,[/(?:社会保険料等の金額)\s*[^\d]{0,60}([\d,]{4,})/i]); const incomeTax=extractNumberAfter(s,[/(?:源泉徴収税額)\s*[^\d]{0,60}([\d,]{4,})/i]); return {year:d.year,annualSalary,social,incomeTax,document:name,source:'google-drive'};
+    const raw=typeof text==='string'?text:(text?.text||'');
+    const reiwa=String(raw).match(/令\s*和\s*(\d{1,2})\s*年\s*分/);
+    const fd=filenameDateFallback(name); const d=extractDateParts(raw,name);
+    const year=reiwa?2018+Number(reiwa[1]):(fd.year??d.year);
+    const pick=(label,aliases=[])=>{
+      const vals=[label,...aliases];
+      if(text&&typeof text==='object'&&Array.isArray(text.pages)){
+        for(const v of vals){const n=extractLabeledNumberByLayout(text,v);if(n!=null)return n;}
+        const joined=text.pages.flat().map(it=>String(it.str||'')).join('');
+        if(vals.some(v=>joined.includes(String(v).replace(/[\u3000\s()（）]/g,''))))return null;
+      }
+      return extractExactYenAfterLabel(text,vals);
+    };
+    const annualSalary=pick('給与・賞与',['支払金額']) ?? extractExactYenAfterLabel(text,['給与・賞与','支払金額']);
+    const salaryIncomeAfterDeduction=pick('給与所得控除後の金額');
+    const deductionsTotal=pick('所得控除の額の合計額');
+    const incomeTax=pick('源泉徴収税額');
+    const social=pick('社会保険料等の金額');
+    const lifeInsuranceDeduction=pick('生命保険料の控除額');
+    const earthquakeInsuranceDeduction=pick('地震保険料の控除額');
+    const housingLoanDeduction=pick('住宅借入金等特別控除の額');
+    const specialDependent=pick('特定親族特別控除の額');
+    const basicDeduction=pick('基礎控除の額');
+    const incomeAdjustment=pick('所得金額調整控除額',['調整控除額']);
+    const newLifeInsurance=pick('新生命保険料の金額');
+    const oldLifeInsurance=pick('旧生命保険料の金額');
+    const nursingInsurance=pick('介護医療保険料の金額');
+    const newPension=pick('新個人年金保険料の金額');
+    const oldPension=pick('旧個人年金保険料の金額');
+    const required=[annualSalary,salaryIncomeAfterDeduction,deductionsTotal,incomeTax,social];
+    const arithmeticOk=required.every(Number.isFinite);
+    return {year,annualSalary,salaryIncomeAfterDeduction,deductionsTotal,social,incomeTax,lifeInsuranceDeduction,earthquakeInsuranceDeduction,housingLoanDeduction,specialDependent,basicDeduction,incomeAdjustment,newLifeInsurance,oldLifeInsurance,nursingInsurance,newPension,oldPension,document:name,source:'google-drive',status:'actual',arithmeticOk,needsReview:!arithmeticOk};
   }
   function uniquePush(arr,item,key){const k=key(item);if(!arr.some(x=>key(x)===k))arr.push(item);}
   function recordHistory(state,item){
@@ -568,28 +701,28 @@ const FurusatoGoogleDrive = (() => {
   async function scanAndImport(state,onProgress,filesOverride){
     const targetYear=Number(state.importSettings?.targetYear||state.year||new Date().getFullYear()); const priorYear=targetYear-1; state.year=targetYear;
     const files=Array.isArray(filesOverride)?filesOverride:await listCandidateFiles(targetYear);
-    const result={files:files.length,added:0,review:0,skipped:0,errors:[],salaryCandidates:files.filter(f=>f.candidateType==='salary').length,salaryImported:0,salaryReview:0,salaryParsed:0,salaryOcr:0,salaryRejected:0,candidates:files.map(f=>({name:f.name,type:f.candidateType,year:f.filenameYear}))}; state.importHistory=Array.isArray(state.importHistory)?state.importHistory:[];
+    const result={files:files.length,added:0,review:0,skipped:0,errors:[],salaryCandidates:files.filter(f=>f.candidateType==='salary').length,salaryImported:0,salaryReview:0,salaryParsed:0,salaryOcr:0,salaryRejected:0,candidates:files.map(f=>({name:f.name,type:f.candidateType,year:f.filenameYear}))}; state.importHistory=Array.isArray(state.importHistory)?state.importHistory:[]; state.importFileDetails=[];
     state.priorSalaryRecords=(state.priorSalaryRecords||[]).filter(x=>Number(x.year)===priorYear); state.priorBonusRecords=(state.priorBonusRecords||[]).filter(x=>Number(x.year)===priorYear); state.priorSocialRecords=(state.priorSocialRecords||[]).filter(x=>Number(x.year)===priorYear);
     for(const f of files){
       try{
-        onProgress?.(`解析中: ${f.name}`); const buf=await downloadPdf(f.id); let pdf=await pdfText(buf); pdf=await ensurePdfText(buf,pdf,f.name); const text=pdf.text,detectedType=classifyPdfText(text,f.name),type=detectedType==='unknown' ? ({salary:'salary_slip',bonus:'bonus_slip',withholding:'withholding'}[f.candidateType]||detectedType) : detectedType;
+        onProgress?.(`解析中: ${f.name}`); const buf=await downloadPdf(f.id); let pdf=await pdfText(buf); pdf=await ensurePdfText(buf,pdf,f.name); const text=pdf.text,detectedType=classifyPdfText(text,f.name),type=detectedType==='unknown' ? ({salary:'salary_slip',bonus:'bonus_slip',withholding:'withholding'}[f.candidateType]||detectedType) : detectedType; const detail={name:f.name,id:f.id,type:f.candidateType,filenameYear:f.filenameYear||null,detectedType:type,textChars:String(text||'').length,textItemCount:pdf.textItemCount||0,ocrUsed:!!pdf.ocrUsed,ocrConfidence:pdf.ocrConfidence||0,ocrError:pdf.ocrError||''}; state.importFileDetails.push(detail);
         if(type==='salary_slip'){
-          const x=parseSalaryPdf(pdf,f.name); x.ocrUsed=!!pdf.ocrUsed; if(x.ocrUsed)result.salaryOcr++; x.ocrConfidence=pdf.ocrConfidence||0; x.textItemCount=pdf.textItemCount||0; x.textChars=String(pdf.text||'').length; x.ocrError=pdf.ocrError||''; const inScope=[targetYear,priorYear].includes(Number(x.year));
+          const x=parseSalaryPdf(pdf,f.name); Object.assign(detail,{year:x.year||null,month:x.month||null,gross:x.gross||0,taxableGross:x.taxableGross||0,grossTotal:x.grossTotal||0,nonTaxableTotal:x.nonTaxableTotal||0,social:x.social||0,components:x.components||{},socialComponents:x.socialComponents||{},needsReview:!!x.needsReview}); x.ocrUsed=!!pdf.ocrUsed; if(x.ocrUsed)result.salaryOcr++; x.ocrConfidence=pdf.ocrConfidence||0; x.textItemCount=pdf.textItemCount||0; x.textChars=String(pdf.text||'').length; x.ocrError=pdf.ocrError||''; const inScope=[targetYear,priorYear].includes(Number(x.year));
           if(!inScope){result.skipped++; recordHistory(state,{at:new Date().toISOString(),name:f.name,type:'salary',year:x.year||f.filenameYear||null,status:'対象外',reason:'対象年/前年ではない'});continue}
           if(upsertSalaryRecord(state,x,f,targetYear,result)){
             recordHistory(state,{at:new Date().toISOString(),name:f.name,type:'salary',year:x.year,month:x.month,status:'取り込み済み',taxableGross:x.taxableGross,grossTotal:x.grossTotal,social:x.social,needsReview:!!x.needsReview,ocrUsed:!!x.ocrUsed,ocrConfidence:x.ocrConfidence||0,textChars:x.textChars||0,textItemCount:x.textItemCount||0,ocrError:x.ocrError||''});
           } else if(x.year===priorYear&&x.month&&x.gross){uniquePush(state.priorSalaryRecords,{year:priorYear,month:x.month,gross:x.taxableGross,taxableGross:x.taxableGross,grossTotal:x.grossTotal,nonTaxableTotal:x.nonTaxableTotal,components:x.components||[],source:'google-drive',status:'prior',document:f.name,driveFileId:f.id,needsReview:x.needsReview},v=>`${v.year}-${v.month}-${v.document}`);if(x.social!=null)uniquePush(state.priorSocialRecords,{year:priorYear,month:x.month,amount:x.social,components:x.socialComponents||{},source:'google-drive',status:'prior',document:f.name,driveFileId:f.id},v=>`${v.year}-${v.month}-${v.document}`);result.added++;recordHistory(state,{at:new Date().toISOString(),name:f.name,type:'salary',year:x.year,month:x.month,status:'前年保存',taxableGross:x.taxableGross,grossTotal:x.grossTotal,social:x.social,needsReview:!!x.needsReview,ocrUsed:!!x.ocrUsed,ocrConfidence:x.ocrConfidence||0,textChars:x.textChars||0,textItemCount:x.textItemCount||0,ocrError:x.ocrError||''});}else {result.review++; if(f.candidateType==='salary'){result.salaryReview++;result.salaryRejected++;}recordHistory(state,{at:new Date().toISOString(),name:f.name,type:'salary',year:x.year||f.filenameYear||null,month:x.month||null,status:'確認待ち',taxableGross:x.taxableGross,grossTotal:x.grossTotal,social:x.social,needsReview:true,reason:`給与登録できませんでした：課税対象額=${x.taxableGross==null?'取得失敗':x.taxableGross}／支給合計=${x.grossTotal==null?'取得失敗':x.grossTotal}／非課税=${x.nonTaxableTotal==null?'取得失敗':x.nonTaxableTotal}／年月=${x.year||f.filenameYear||'不明'}-${x.month||'不明'}／OCR=${x.ocrUsed?'実行':'未実行'}${x.ocrError?`／OCRエラー=${x.ocrError}`:''}／文字数=${x.textChars||0}／文字項目=${x.textItemCount||0}`});}
         }else if(type==='bonus_slip'){
-          const x=parseBonusPdf(pdf,f.name); if(![targetYear,priorYear].includes(Number(x.year))){result.skipped++;continue}
+          const x=parseBonusPdf(pdf,f.name); Object.assign(detail,{year:x.year||null,month:x.month||null,date:x.date||null,amount:x.amount||0,social:x.social||0,socialComponents:x.socialComponents||{},needsReview:!!x.needsReview}); if(![targetYear,priorYear].includes(Number(x.year))){result.skipped++;continue}
           if(!upsertBonusRecord(state,x,f,targetYear,result) && x.year===priorYear && x.date&&x.amount){state.priorBonusRecords=state.priorBonusRecords||[];uniquePush(state.priorBonusRecords,{year:priorYear,date:x.date,month:x.month,amount:x.amount,social:x.social,socialComponents:x.socialComponents||{},standardBonusHealth:x.standardBonusHealth,standardBonusPension:x.standardBonusPension,source:'prior',status:'prior',document:f.name,driveFileId:f.id},v=>`${v.date}-${v.document}`);result.added++;state.importHistory.unshift({at:new Date().toISOString(),name:f.name,type:'bonus',year:x.year||f.filenameYear||null,date:x.date||null,status:'取り込み済み',amount:x.amount||null,social:x.social||null,needsReview:!!x.needsReview});}else if(!(x.date&&x.amount)){result.review++;state.importHistory.unshift({at:new Date().toISOString(),name:f.name,type:'bonus',year:x.year||f.filenameYear||null,status:'確認待ち',amount:x.amount||null,social:x.social||null,needsReview:true,reason:'賞与額または年月を取得できませんでした'});}
         }else if(type==='withholding'){
-          const x=parseWithholdingPdf(text,f.name); if(x.year&&![targetYear,priorYear].includes(Number(x.year))){result.skipped++;continue}
+          const x=parseWithholdingPdf(text,f.name); Object.assign(detail,{year:x.year||null,annualSalary:x.annualSalary||0,salaryIncomeAfterDeduction:x.salaryIncomeAfterDeduction||0,deductionsTotal:x.deductionsTotal||0,social:x.social||0,incomeTax:x.incomeTax||0,lifeInsuranceDeduction:x.lifeInsuranceDeduction||0,earthquakeInsuranceDeduction:x.earthquakeInsuranceDeduction||0,housingLoanDeduction:x.housingLoanDeduction||0,specialDependent:x.specialDependent||0,basicDeduction:x.basicDeduction||0,incomeAdjustment:x.incomeAdjustment||0,newLifeInsurance:x.newLifeInsurance||0,oldLifeInsurance:x.oldLifeInsurance||0,nursingInsurance:x.nursingInsurance||0,newPension:x.newPension||0,oldPension:x.oldPension||0,needsReview:!!x.needsReview}); if(x.year&&![targetYear,priorYear].includes(Number(x.year))){result.skipped++;continue}
           state.sourceDocuments=state.sourceDocuments||[];const old=state.sourceDocuments.find(d=>d.file===f.name);const doc={file:f.name,type,status:'imported',source:'google-drive',driveFileId:f.id,note:`源泉徴収票を取得。${x.year===priorYear?'前年参考値として保持':'対象年の参考資料として保持'}。`,annualSalary:x.annualSalary||0,social:x.social||0,incomeTax:x.incomeTax||0,year:x.year||null};if(old)Object.assign(old,doc);else state.sourceDocuments.push(doc);
           if(x.year===priorYear){state.prior=state.prior||{salary:0,bonus:0,social:0};if(x.annualSalary)state.prior.salary=x.annualSalary;if(x.social)state.prior.social=x.social} result.review++;
         }else {result.skipped++;state.importHistory.unshift({at:new Date().toISOString(),name:f.name,type:type||f.candidateType||'other',year:f.filenameYear||null,status:'対象外'});}
       }catch(e){result.errors.push(`${f.name}: ${e.message}`);recordHistory(state,{at:new Date().toISOString(),name:f.name,type:f.candidateType||'other',year:f.filenameYear||null,status:'エラー',reason:e.message});}
     }
-    rebuildPriorSummary(state,priorYear); buildForecastFromPrior(state,targetYear,Number(state.actualThrough||9)); state.importDiagnostics={at:new Date().toISOString(),targetYear,files:result.files,salaryCandidates:result.salaryCandidates,salaryImported:result.salaryImported,salaryParsed:result.salaryParsed,salaryOcr:result.salaryOcr,salaryRejected:result.salaryRejected,errors:result.errors.slice()}; state.importHistory=state.importHistory.filter(x=>{if(!String(x?.name||'').startsWith(TARGET_FILE_PREFIX))return true;const y=Number(x?.year||0);return !y||y===targetYear||y===priorYear}).slice(0,200); state.importSettings={...(state.importSettings||{}),targetYear,priorYear};
+    rebuildPriorSummary(state,priorYear); buildForecastFromPrior(state,targetYear,Number(state.actualThrough||9)); state.importDiagnostics={at:new Date().toISOString(),targetYear,files:result.files,salaryCandidates:result.salaryCandidates,salaryImported:result.salaryImported,salaryParsed:result.salaryParsed,salaryOcr:result.salaryOcr,salaryRejected:result.salaryRejected,errors:result.errors.slice(),fileDetails:state.importFileDetails||[]}; state.importHistory=state.importHistory.filter(x=>{if(!String(x?.name||'').startsWith(TARGET_FILE_PREFIX))return true;const y=Number(x?.year||0);return !y||y===targetYear||y===priorYear}).slice(0,200); state.importSettings={...(state.importSettings||{}),targetYear,priorYear};
     return result;
   }
   return {CLIENT_KEY,getClientId,setClientId,ready,authorize,signOut,listCandidateFiles,scanAndImport,classifyPdfText,parseSalaryPdf,parseBonusPdf,parseWithholdingPdf,extractLabeledNumber,extractToyotaPayrollAmount,upsertSalaryRecord,upsertBonusRecord,ensurePdfText};
