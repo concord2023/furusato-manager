@@ -10,10 +10,12 @@ const FurusatoModel = (() => {
     bonusSocialRecords:[{date:'2026-07',amount:388387,source:'pdf:1219856-Bonus-202607.pdf',status:'actual',note:'雇用保険・健康保険・介護保険・子ども子育て支援金・年金保険の合計。持株会・所得税は含めない'}],
     socialRecords:[],
     forecastSocial:[],
-    deductions:{ideco:0,earthquake:0,other:0,basicOverride:null},
+    deductions:{ideco:0,earthquake:0,other:0,basicOverride:null,lifeInsurance:{newGeneral:0,oldGeneral:0,nursingMedical:0,newPension:0,oldPension:0,source:'manual',needsConfirmation:false},earthquakeDetail:{paid:0,oldLongTerm:0,source:'manual',needsConfirmation:false},housingLoan:{deduction:0,source:'manual',needsConfirmation:false},otherBreakdown:{medical:0,disability:0,widow:0,workingStudent:0,other:0}},
     adjustments:{temporary:0,temporaryTaxable:true,otherIncome:0},
     taxableAdjustments:[],
     prior:{salary:0,bonus:0,social:0},
+    priorWithholding:null,currentWithholding:null,withholdingRecords:[],
+    family:{spouse:{exists:false,name:'',income:0,age:null,source:'manual',needsConfirmation:false},dependents:[],priorNote:''},
     sourceDocuments:[{file:'1219856-Bonus-202607.pdf',type:'bonus_slip',status:'imported',note:'2026年7月賞与・支給合計5,550,000円'},{file:'1219856-Assets-202608.pdf',type:'asset_statement',status:'review_needed',note:'資産形成・DC等の記載あり。給与/控除には自動反映しない'}],
     donations:[
       {id:'r1',site:'楽天',city:'○○市',item:'米10kg',amount:30000,status:'確定',delivery:'9/27予定',orderId:'R-001',source:'sample'},
@@ -55,6 +57,15 @@ const FurusatoModel = (() => {
     s.importSettings.priorYear=s.importSettings.targetYear-1;
     s.salaryRecords=(s.salaryRecords||[]).map(r=>({...r,taxableGross:r.taxableGross==null?Number(r.gross)||0:Number(r.taxableGross)})).filter(r=>Number(r.taxableGross)>0 || r.source==='manual');
     s.taxableAdjustments=Array.isArray(s.taxableAdjustments)?s.taxableAdjustments:[];
+    s.deductions=s.deductions||{};
+    if(!s.deductions.lifeInsurance)s.deductions.lifeInsurance={newGeneral:0,oldGeneral:0,nursingMedical:0,newPension:0,oldPension:0,source:'manual',needsConfirmation:false};
+    if(!s.deductions.earthquakeDetail)s.deductions.earthquakeDetail={paid:Number(s.deductions.earthquake)||0,oldLongTerm:0,source:'manual',needsConfirmation:false};
+    if(!s.deductions.otherBreakdown)s.deductions.otherBreakdown={medical:0,disability:0,widow:0,workingStudent:0,other:Number(s.deductions.other)||0};
+    s.withholdingRecords=Array.isArray(s.withholdingRecords)?s.withholdingRecords:[];
+    s.family=s.family&&typeof s.family==='object'?s.family:{spouse:{exists:false,name:'',income:0,age:null,source:'manual',needsConfirmation:false},dependents:[],priorNote:''};
+    s.family.spouse=s.family.spouse&&typeof s.family.spouse==='object'?s.family.spouse:{exists:false,name:'',income:0,age:null,source:'manual',needsConfirmation:false};
+    s.family.dependents=Array.isArray(s.family.dependents)?s.family.dependents:[];
+    s.priorWithholding=s.priorWithholding||null; s.currentWithholding=s.currentWithholding||null;
     s.bonusSocialRecords=Array.isArray(s.bonusSocialRecords)?s.bonusSocialRecords:[];
     if(!s.salaryRecords?.length && Array.isArray(raw?.salary)) s.salaryRecords=raw.salary.map((gross,i)=>({month:i+1,gross,source:'auto',status:i+1<=9?'actual':'forecast'}));
     return s;
