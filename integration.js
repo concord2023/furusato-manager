@@ -89,31 +89,88 @@ const FurusatoGoogleDrive = (() => {
     }while(pageToken);
     return out;
   }
-  // All relevant source PDFs use this prefix. Restricting the Drive query to it avoids
-  // scanning unrelated PDFs. A filename year is mandatory: if it is missing, or outside
-  // the target/prior year, the file is skipped BEFORE download/PDF analysis.
-  const TARGET_FILE_PREFIX='1219856';
+  // Search by document type keywords rather than a person/company-specific
+  // employee number. This keeps the importer reusable when payroll PDFs use
+  // a different filename convention. Only the target year and immediately
+  // preceding year are considered before any PDF is downloaded.
+  const DEFAULT_SOURCE_KEYWORDS=['給与','賃金','明細','賞与','ボーナス','源泉徴収','源泉','salary','payroll','bonus','withholding'];
   async function listCandidateFiles(targetYear){
     if(!accessToken)await authorize();
     const currentYear=Number(targetYear)||new Date().getFullYear();
     const priorYear=currentYear-1;
     const years=[priorYear,currentYear];
-    const safe=TARGET_FILE_PREFIX.replace(/'/g,"\\'");
-    const q=`trashed = false and mimeType = 'application/pdf' and name contains '${safe}'`;
+    const keywords=Array.isArray(window.furusatoImportKeywords)&&window.furusatoImportKeywords.length?window.furusatoImportKeywords:DEFAULT_SOURCE_KEYWORDS;
+    const clauses=keywords.map(k=>`name contains '${String(k).replace(/'/g,"\\'")}'`);
+    const employeeId='1219856';
+    const q=`trashed = false and mimeType = 'application/pdf' and name contains '${employeeId}' and (${clauses.join(' or ')})`;
     let rows=[];
     try{rows=await listAllFilesByQuery(q)}catch(e){throw new Error(`Google Drive検索に失敗しました: ${e.message||e}`)}
-    const out=[];
+    const out=[]; const seen=new Set();
     for(const f of rows){
       const name=String(f.name||'');
       const isPdf=/\.pdf$/i.test(name)||f.mimeType==='application/pdf';
-      if(!isPdf||!name.includes(TARGET_FILE_PREFIX))continue;
+      if(!isPdf)continue;
       const y=yearFromName(name);
       if(y===null || !years.includes(y))continue;
       const type=candidateTypeFromName(name);
       if(type==='unknown')continue;
+      const key=String(f.id||name); if(seen.has(key))continue; seen.add(key);
       out.push({...f,candidate:true,candidateType:type,filenameYear:y});
     }
     return out.sort((a,b)=>String(b.modifiedTime||'').localeCompare(String(a.modifiedTime||'')));
+  }
+  // Parsed-file cache: keep the expensive PDF/OCR result in IndexedDB and only
+  // re-download/re-parse a file when its Drive metadata (or parser version) changes.
+  // This is deliberately separate from furusatoState: payroll state is the calculation
+  // snapshot, while this store is the source-document cache.
+  const IMPORT_CACHE_DB='furusatoSourceCache';
+  const IMPORT_CACHE_VERSION='20260921-forecast-cache-2';
+  function cacheSignature(f){return `${f.id||f.name}|${f.modifiedTime||''}|${f.size||''}`}
+  function openImportCache(){return new Promise((resolve,reject)=>{
+    if(!('indexedDB' in window))return resolve(null);
+    let req; try{req=indexedDB.open(IMPORT_CACHE_DB,1)}catch(e){return resolve(null)}
+    req.onupgradeneeded=()=>{try{const db=req.result;if(!db.objectStoreNames.contains('files'))db.createObjectStore('files',{keyPath:'id'})}catch{}};
+    req.onsuccess=()=>resolve(req.result); req.onerror=()=>resolve(null);
+  })}
+  async function getCachedParsed(f){
+    const db=await openImportCache(); if(!db)return null;
+    return new Promise(resolve=>{try{const tx=db.transaction('files','readonly'),st=tx.objectStore('files'),q=st.get(String(f.id||f.name));q.onsuccess=()=>{const v=q.result;resolve(v&&v.version===IMPORT_CACHE_VERSION&&v.signature===cacheSignature(f)?v:null)};q.onerror=()=>resolve(null)}catch{resolve(null)}});
+  }
+  async function putCachedParsed(f,pdf,x,type){
+    const db=await openImportCache(); if(!db)return;
+    await new Promise(resolve=>{try{const tx=db.transaction('files','readwrite');tx.objectStore('files').put({id:String(f.id||f.name),version:IMPORT_CACHE_VERSION,signature:cacheSignature(f),name:f.name,type:f.candidateType||type,storedAt:new Date().toISOString(),pdf,x});tx.oncomplete=()=>resolve();tx.onerror=()=>resolve();tx.onabort=()=>resolve()}catch{resolve()}});
+  }
+  async function cachedOrParsed(f){
+    const cached=await getCachedParsed(f); if(cached)return {pdf:cached.pdf,x:cached.x,type:cached.type,cacheHit:true};
+    const buf=await downloadPdf(f.id); let pdf=await pdfText(buf); pdf=await ensurePdfText(buf,pdf,f.name);
+    const detectedType=classifyPdfText(pdf.text,f.name);
+    const type=detectedType==='unknown' ? ({salary:'salary_slip',bonus:'bonus_slip',withholding:'withholding'}[f.candidateType]||detectedType) : detectedType;
+    let x=null;
+    if(type==='salary_slip')x=parseSalaryPdf(pdf,f.name);
+    else if(type==='bonus_slip')x=parseBonusPdf(pdf,f.name);
+    else if(type==='withholding')x=parseWithholdingPdf(pdf,f.name);
+    await putCachedParsed(f,pdf,x,type);
+    return {pdf,x,type,cacheHit:false};
+  }
+  function neededCandidates(files,state,targetYear,priorYear){
+    const currentBonus=state.bonusRecords||[];
+    const hasCurrentSeason=s=>currentBonus.some(x=>Number(x.amount)>0&&bonusSeason(Number(String(x.date||'').slice(5,7))||Number(x.month))===s);
+    const priorBonus=state.priorBonusRecords||[];
+    const hasPriorSeason=s=>priorBonus.some(x=>bonusSeason(Number(String(x.date||'').slice(5,7))||Number(x.month))===s&&Number(x.amount)>0);
+    return files.filter(f=>{
+      const y=Number(f.filenameYear);
+      if(y===targetYear)return true;
+      if(y!==priorYear)return false;
+      if(f.candidateType==='withholding')return true;
+      if(f.candidateType==='bonus'){
+        const m=Number(String(f.name||'').match(/-(\d{6})\b/)?.[1]?.slice(4,6)||0);
+        const s=bonusSeason(m);
+        return !!s && !hasCurrentSeason(s) && !hasPriorSeason(s);
+      }
+      // Prior-year monthly salary is not used for the current-year salary forecast.
+      // Do not download/parse 2025 Jan-Dec payroll just because 2026 was scanned.
+      return false;
+    });
   }
   async function downloadPdf(fileId){
     if(!accessToken)await authorize();
@@ -1083,25 +1140,26 @@ const FurusatoGoogleDrive = (() => {
   }
   async function scanAndImport(state,onProgress,filesOverride){
     const targetYear=Number(state.importSettings?.targetYear||state.year||new Date().getFullYear()); const priorYear=targetYear-1; state.year=targetYear;
-    const files=Array.isArray(filesOverride)?filesOverride:await listCandidateFiles(targetYear);
-    const result={files:files.length,added:0,review:0,skipped:0,errors:[],salaryCandidates:files.filter(f=>f.candidateType==='salary').length,salaryImported:0,salaryReview:0,salaryParsed:0,salaryOcr:0,salaryRejected:0,candidates:files.map(f=>({name:f.name,type:f.candidateType,year:f.filenameYear}))}; state.importHistory=Array.isArray(state.importHistory)?state.importHistory:[]; state.importFileDetails=[];
+    const allFiles=Array.isArray(filesOverride)?filesOverride:await listCandidateFiles(targetYear);
+    const files=neededCandidates(allFiles,state,targetYear,priorYear);
+    const result={files:files.length,discoveredFiles:allFiles.length,added:0,review:0,skipped:0,cacheHits:0,cacheMisses:0,downloads:0,parsed:0,errors:[],salaryCandidates:files.filter(f=>f.candidateType==='salary').length,salaryImported:0,salaryReview:0,salaryParsed:0,salaryOcr:0,salaryRejected:0,candidates:files.map(f=>({name:f.name,type:f.candidateType,year:f.filenameYear}))}; state.importHistory=Array.isArray(state.importHistory)?state.importHistory:[]; state.importFileDetails=[];
     state.priorSalaryRecords=(state.priorSalaryRecords||[]).filter(x=>Number(x.year)===priorYear); state.priorBonusRecords=(state.priorBonusRecords||[]).filter(x=>Number(x.year)===priorYear); state.priorSocialRecords=(state.priorSocialRecords||[]).filter(x=>Number(x.year)===priorYear);
     state.salaryRecords=(state.salaryRecords||[]).filter(x=>x.source==='manual'||Number(x.year||targetYear)===targetYear);
     state.bonusRecords=(state.bonusRecords||[]).filter(x=>x.source==='manual'||Number(x.year||String(x.date||'').slice(0,4))===targetYear);
     for(const f of files){
       try{
-        onProgress?.(`解析中: ${f.name}`); const buf=await downloadPdf(f.id); let pdf=await pdfText(buf); pdf=await ensurePdfText(buf,pdf,f.name); const text=pdf.text,detectedType=classifyPdfText(text,f.name),type=detectedType==='unknown' ? ({salary:'salary_slip',bonus:'bonus_slip',withholding:'withholding'}[f.candidateType]||detectedType) : detectedType; const detail={name:f.name,id:f.id,type:f.candidateType,filenameYear:f.filenameYear||null,detectedType:type,textChars:String(text||'').length,textItemCount:pdf.textItemCount||0,ocrUsed:!!pdf.ocrUsed,ocrConfidence:pdf.ocrConfidence||0,ocrError:pdf.ocrError||'',ocrWordCount:pdf.ocrWordCount||0,ocrValidated:!!pdf.ocrValidated,ocrAttempts:pdf.ocrAttempts||[],pageCount:pdf.pageCount||0,pageMeta:pdf.pageMeta||[],ocrWidth:pdf.ocrWidth||0,ocrHeight:pdf.ocrHeight||0,ocrImageBytes:pdf.imageBytes||0,ocrCornerNonWhite:pdf.cornerNonWhite||0,ocrCornerMean:pdf.cornerMean||0}; state.importFileDetails.push(detail);
+        const cached=await cachedOrParsed(f); const pdf=cached.pdf; const x=cached.x; const type=cached.type; if(cached.cacheHit)result.cacheHits++;else{result.cacheMisses++;result.downloads++;result.parsed++;} onProgress?.(`${cached.cacheHit?'保存済みを使用':'解析中'}: ${f.name}`); const text=pdf.text; const detail={name:f.name,id:f.id,type:f.candidateType,filenameYear:f.filenameYear||null,detectedType:type,textChars:String(text||'').length,textItemCount:pdf.textItemCount||0,ocrUsed:!!pdf.ocrUsed,ocrConfidence:pdf.ocrConfidence||0,ocrError:pdf.ocrError||'',ocrWordCount:pdf.ocrWordCount||0,ocrValidated:!!pdf.ocrValidated,ocrAttempts:pdf.ocrAttempts||[],pageCount:pdf.pageCount||0,pageMeta:pdf.pageMeta||[],ocrWidth:pdf.ocrWidth||0,ocrHeight:pdf.ocrHeight||0,ocrImageBytes:pdf.imageBytes||0,ocrCornerNonWhite:pdf.cornerNonWhite||0,ocrCornerMean:pdf.ocrCornerMean||0}; state.importFileDetails.push(detail);
         if(type==='salary_slip'){
-          const x=parseSalaryPdf(pdf,f.name); Object.assign(detail,{year:x.year||null,month:x.month||null,gross:x.gross||0,taxableGross:x.taxableGross||0,grossTotal:x.grossTotal||0,nonTaxableTotal:x.nonTaxableTotal||0,social:x.social||0,components:x.components||{},socialComponents:x.socialComponents||{},needsReview:!!x.needsReview,registrationCore:!!(x.year&&x.month&&Number(x.taxableGross)>0)}); x.ocrUsed=!!pdf.ocrUsed; if(x.ocrUsed)result.salaryOcr++; x.ocrConfidence=pdf.ocrConfidence||0; x.textItemCount=pdf.textItemCount||0; x.textChars=String(pdf.text||'').length; x.ocrError=pdf.ocrError||''; const inScope=[targetYear,priorYear].includes(Number(x.year));
+          Object.assign(detail,{year:x.year||null,month:x.month||null,gross:x.gross||0,taxableGross:x.taxableGross||0,grossTotal:x.grossTotal||0,nonTaxableTotal:x.nonTaxableTotal||0,social:x.social||0,components:x.components||{},socialComponents:x.socialComponents||{},needsReview:!!x.needsReview,registrationCore:!!(x.year&&x.month&&Number(x.taxableGross)>0)}); x.ocrUsed=!!pdf.ocrUsed; if(x.ocrUsed)result.salaryOcr++; x.ocrConfidence=pdf.ocrConfidence||0; x.textItemCount=pdf.textItemCount||0; x.textChars=String(pdf.text||'').length; x.ocrError=pdf.ocrError||''; const inScope=[targetYear,priorYear].includes(Number(x.year));
           if(!inScope){result.skipped++; recordHistory(state,{at:new Date().toISOString(),name:f.name,type:'salary',year:x.year||f.filenameYear||null,status:'対象外',reason:'対象年/前年ではない'});continue}
           if(upsertSalaryRecord(state,x,f,targetYear,result)){
             recordHistory(state,{at:new Date().toISOString(),name:f.name,type:'salary',year:x.year,month:x.month,status:'取り込み済み',taxableGross:x.taxableGross,grossTotal:x.grossTotal,social:x.social,needsReview:!!x.needsReview,ocrUsed:!!x.ocrUsed,ocrConfidence:x.ocrConfidence||0,textChars:x.textChars||0,textItemCount:x.textItemCount||0,ocrWordCount:pdf.ocrWordCount||0,ocrValidated:!!pdf.ocrValidated,ocrError:x.ocrError||''});
           } else if(x.year===priorYear&&x.month&&x.gross){uniquePush(state.priorSalaryRecords,{year:priorYear,month:x.month,gross:x.taxableGross,taxableGross:x.taxableGross,grossTotal:x.grossTotal,nonTaxableTotal:x.nonTaxableTotal,components:x.components||[],source:'google-drive',status:'prior',document:f.name,driveFileId:f.id,needsReview:x.needsReview},v=>`${v.year}-${v.month}-${v.document}`);if(x.social!=null)uniquePush(state.priorSocialRecords,{year:priorYear,month:x.month,amount:x.social,components:x.socialComponents||{},source:'google-drive',status:'prior',document:f.name,driveFileId:f.id},v=>`${v.year}-${v.month}-${v.document}`);result.added++;recordHistory(state,{at:new Date().toISOString(),name:f.name,type:'salary',year:x.year,month:x.month,status:'前年保存',taxableGross:x.taxableGross,grossTotal:x.grossTotal,social:x.social,needsReview:!!x.needsReview,ocrUsed:!!x.ocrUsed,ocrConfidence:x.ocrConfidence||0,textChars:x.textChars||0,textItemCount:x.textItemCount||0,ocrWordCount:pdf.ocrWordCount||0,ocrValidated:!!pdf.ocrValidated,ocrError:x.ocrError||''});}else {result.review++; if(f.candidateType==='salary'){result.salaryReview++;result.salaryRejected++;}recordHistory(state,{at:new Date().toISOString(),name:f.name,type:'salary',year:x.year||f.filenameYear||null,month:x.month||null,status:'確認待ち',taxableGross:x.taxableGross,grossTotal:x.grossTotal,social:x.social,needsReview:true,reason:`給与登録できませんでした：課税対象額=${x.taxableGross==null?'取得失敗':x.taxableGross}／支給合計=${x.grossTotal==null?'取得失敗':x.grossTotal}／非課税=${x.nonTaxableTotal==null?'取得失敗':x.nonTaxableTotal}／年月=${x.year||f.filenameYear||'不明'}-${x.month||'不明'}／OCR=${x.ocrUsed?'実行':'未実行'}${x.ocrError?`／OCRエラー=${x.ocrError}`:''}／文字数=${x.textChars||0}／文字項目=${x.textItemCount||0}`});}
         }else if(type==='bonus_slip'){
-          const x=parseBonusPdf(pdf,f.name); Object.assign(detail,{year:x.year||null,month:x.month||null,date:x.date||null,amount:x.amount||0,social:x.social||0,socialComponents:x.socialComponents||{},needsReview:!!x.needsReview,registrationCore:!!(x.date&&Number(x.amount)>0&&x.season)}); if(![targetYear,priorYear].includes(Number(x.year))){result.skipped++;continue}
+          Object.assign(detail,{year:x.year||null,month:x.month||null,date:x.date||null,amount:x.amount||0,social:x.social||0,socialComponents:x.socialComponents||{},needsReview:!!x.needsReview,registrationCore:!!(x.date&&Number(x.amount)>0&&x.season)}); if(![targetYear,priorYear].includes(Number(x.year))){result.skipped++;continue}
           if(!upsertBonusRecord(state,x,f,targetYear,result) && Number(x.year)===Number(priorYear) && x.date&&x.amount&&x.season){state.priorBonusRecords=state.priorBonusRecords||[];const season=x.season||bonusSeason(x.month);state.priorBonusRecords=state.priorBonusRecords.filter(v=>!(Number(v.year)===Number(priorYear)&&(v.season||bonusSeason(v.month))===season));state.priorBonusRecords.push({year:priorYear,date:x.date,month:x.month,season,amount:x.amount,social:x.social,socialComponents:x.socialComponents||{},standardBonusHealth:x.standardBonusHealth,standardBonusPension:x.standardBonusPension,source:'prior',status:'prior',document:f.name,driveFileId:f.id});result.added++;recordHistory(state,{at:new Date().toISOString(),name:f.name,type:'bonus',year:x.year||f.filenameYear||null,month:x.month||null,date:x.date||null,status:'取り込み済み',amount:x.amount||null,social:x.social||null,needsReview:false});}else if(!(x.date&&x.amount&&x.season)){result.review++;state.importHistory.unshift({at:new Date().toISOString(),name:f.name,type:'bonus',year:x.year||f.filenameYear||null,status:'確認待ち',amount:x.amount||null,social:x.social||null,needsReview:true,reason:x.date&&x.amount&&!x.season?'賞与月が夏（5〜9月）/冬（10〜2月）のどちらにも判定できませんでした':'賞与額または年月を取得できませんでした'});}
         }else if(type==='withholding'){
-          const x=parseWithholdingPdf(pdf,f.name); Object.assign(detail,{year:x.year||null,annualSalary:x.annualSalary||0,salaryIncomeAfterDeduction:x.salaryIncomeAfterDeduction||0,deductionsTotal:x.deductionsTotal||0,social:x.social||0,incomeTax:x.incomeTax||0,lifeInsuranceDeduction:x.lifeInsuranceDeduction||0,earthquakeInsuranceDeduction:x.earthquakeInsuranceDeduction||0,oldLongTermDamageInsurance:x.oldLongTermDamageInsurance||0,housingLoanDeduction:x.housingLoanDeduction||0,specialDependent:x.specialDependent||0,basicDeduction:x.basicDeduction||0,incomeAdjustment:x.incomeAdjustment||0,newLifeInsurance:x.newLifeInsurance||0,oldLifeInsurance:x.oldLifeInsurance||0,nursingInsurance:x.nursingInsurance||0,newPension:x.newPension||0,oldPension:x.oldPension||0,spousePresent:!!x.spousePresent,dependentAgeList:x.dependentAgeList||[],needsReview:!!x.needsReview}); if(x.year&&![targetYear,priorYear].includes(Number(x.year))){result.skipped++;continue}
+          Object.assign(detail,{year:x.year||null,annualSalary:x.annualSalary||0,salaryIncomeAfterDeduction:x.salaryIncomeAfterDeduction||0,deductionsTotal:x.deductionsTotal||0,social:x.social||0,incomeTax:x.incomeTax||0,lifeInsuranceDeduction:x.lifeInsuranceDeduction||0,earthquakeInsuranceDeduction:x.earthquakeInsuranceDeduction||0,oldLongTermDamageInsurance:x.oldLongTermDamageInsurance||0,housingLoanDeduction:x.housingLoanDeduction||0,specialDependent:x.specialDependent||0,basicDeduction:x.basicDeduction||0,incomeAdjustment:x.incomeAdjustment||0,newLifeInsurance:x.newLifeInsurance||0,oldLifeInsurance:x.oldLifeInsurance||0,nursingInsurance:x.nursingInsurance||0,newPension:x.newPension||0,oldPension:x.oldPension||0,spousePresent:!!x.spousePresent,dependentAgeList:x.dependentAgeList||[],needsReview:!!x.needsReview}); if(x.year&&![targetYear,priorYear].includes(Number(x.year))){result.skipped++;continue}
           state.sourceDocuments=state.sourceDocuments||[];const old=state.sourceDocuments.find(d=>d.file===f.name);const doc={file:f.name,type,status:'imported',source:'google-drive',driveFileId:f.id,note:`源泉徴収票を取得。${x.year===priorYear?'前年参考値として保持':'対象年の参考資料として保持'}。`,annualSalary:x.annualSalary||0,social:x.social||0,incomeTax:x.incomeTax||0,year:x.year||null};if(old)Object.assign(old,doc);else state.sourceDocuments.push(doc);
           state.withholdingRecords=Array.isArray(state.withholdingRecords)?state.withholdingRecords:[];
           const wr={...x,source:'google-drive',status:'actual',document:f.name,driveFileId:f.id};
@@ -1126,7 +1184,7 @@ const FurusatoGoogleDrive = (() => {
         }else {result.skipped++;state.importHistory.unshift({at:new Date().toISOString(),name:f.name,type:type||f.candidateType||'other',year:f.filenameYear||null,status:'対象外'});}
       }catch(e){result.errors.push(`${f.name}: ${e.message}`);recordHistory(state,{at:new Date().toISOString(),name:f.name,type:f.candidateType||'other',year:f.filenameYear||null,status:'エラー',reason:e.message});}
     }
-    rebuildPriorSummary(state,priorYear); const actualThrough=deriveActualThrough(state,targetYear); buildForecastFromPrior(state,targetYear,actualThrough); state.importDiagnostics={at:new Date().toISOString(),targetYear,actualThrough,files:result.files,salaryCandidates:result.salaryCandidates,salaryImported:result.salaryImported,salaryParsed:result.salaryParsed,salaryOcr:result.salaryOcr,salaryRejected:result.salaryRejected,errors:result.errors.slice(),fileDetails:state.importFileDetails||[],runtimeReadout:runtimeDiagnostics.slice()}; state.importHistory=state.importHistory.filter(x=>{if(!String(x?.name||'').startsWith(TARGET_FILE_PREFIX))return true;const y=Number(x?.year||0);return !y||y===targetYear||y===priorYear}).slice(0,200); state.importSettings={...(state.importSettings||{}),targetYear,priorYear};
+    rebuildPriorSummary(state,priorYear); const actualThrough=deriveActualThrough(state,targetYear); buildForecastFromPrior(state,targetYear,actualThrough); state.importDiagnostics={at:new Date().toISOString(),targetYear,actualThrough,files:result.files,discoveredFiles:result.discoveredFiles,cacheHits:result.cacheHits,cacheMisses:result.cacheMisses,downloads:result.downloads,parsed:result.parsed,salaryCandidates:result.salaryCandidates,salaryImported:result.salaryImported,salaryParsed:result.salaryParsed,salaryOcr:result.salaryOcr,salaryRejected:result.salaryRejected,errors:result.errors.slice(),fileDetails:state.importFileDetails||[],runtimeReadout:runtimeDiagnostics.slice()}; state.importHistory=state.importHistory.filter(x=>{const y=Number(x?.year||0);return !y||y===targetYear||y===priorYear}).slice(0,200); state.importSettings={...(state.importSettings||{}),targetYear,priorYear};
     return result;
   }
   return {CLIENT_KEY,getClientId,setClientId,ready,authorize,signOut,listCandidateFiles,scanAndImport,classifyPdfText,parseSalaryPdf,parseBonusPdf,parseWithholdingPdf,extractLabeledNumber,extractToyotaPayrollAmount,extractExactYenAfterLabel,upsertSalaryRecord,upsertBonusRecord,ensurePdfText,getRuntimeDiagnostics,clearRuntimeDiagnostics,getLastOcrImageDataUrl:()=>lastOcrImageDataUrl};

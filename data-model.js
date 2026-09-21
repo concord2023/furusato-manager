@@ -1,13 +1,13 @@
 // Data model and normalization for the ふるさと納税マネージャー.
 const FurusatoModel = (() => {
   const DEFAULT = {
-    schemaVersion: 7, year: 2026, asOf: '2026-09-17', actualThrough: 9, importSettings:{targetYear:2026,priorYear:2025}, importHistory:[],
+    schemaVersion: 10, year: new Date().getFullYear(), asOf: new Date().toISOString().slice(0,10), actualThrough: 0, importSettings:{targetYear:new Date().getFullYear(),priorYear:new Date().getFullYear()-1}, importHistory:[],
     salaryRecords: [],
     forecastSalary: [],
-    forecastMethod:{salary:'2026年4〜9月実績平均',social:'2026年4〜9月実績平均',bonus:'対象年の未支給シーズンは前年同シーズン賞与を参考'},
-    bonusRecords:[{date:'2026-07',amount:5550000,source:'pdf:1219856-Bonus-202607.pdf',status:'actual',document:'1219856-Bonus-202607.pdf',note:'第122期 後半期賞与'}],
+    forecastMethod:{salary:'対象年4〜9月実績平均（未取得月を自動予測）',social:'対象年4〜9月実績平均（未取得月を自動予測）',bonus:'対象年の未支給シーズンは前年同シーズン賞与を参考'},
+    bonusRecords:[],
     forecastBonus:0,
-    bonusSocialRecords:[{date:'2026-07',amount:388387,source:'pdf:1219856-Bonus-202607.pdf',status:'actual',note:'雇用保険・健康保険・介護保険・子ども子育て支援金・年金保険の合計。持株会・所得税は含めない'}],
+    bonusSocialRecords:[],
     socialRecords:[],
     forecastSocial:[],
     deductions:{ideco:0,earthquake:0,other:0,basicOverride:null,lifeInsurance:{newGeneral:0,oldGeneral:0,nursingMedical:0,newPension:0,oldPension:0,source:'manual',needsConfirmation:false},earthquakeDetail:{paid:0,oldLongTerm:0,source:'manual',needsConfirmation:false},housingLoan:{deduction:0,source:'manual',needsConfirmation:false},otherBreakdown:{medical:0,disability:0,widow:0,workingStudent:0,other:0}},
@@ -16,13 +16,8 @@ const FurusatoModel = (() => {
     prior:{salary:0,bonus:0,social:0},
     priorWithholding:null,currentWithholding:null,withholdingRecords:[],
     family:{spouse:{exists:false,name:'',income:0,age:null,source:'manual',needsConfirmation:false},dependents:[],priorNote:''},
-    sourceDocuments:[{file:'1219856-Bonus-202607.pdf',type:'bonus_slip',status:'imported',note:'2026年7月賞与・支給合計5,550,000円'},{file:'1219856-Assets-202608.pdf',type:'asset_statement',status:'review_needed',note:'資産形成・DC等の記載あり。給与/控除には自動反映しない'}],
-    donations:[
-      {id:'r1',site:'楽天',city:'○○市',item:'米10kg',amount:30000,status:'確定',delivery:'9/27予定',orderId:'R-001',source:'sample'},
-      {id:'s1',site:'さとふる',city:'△△市',item:'牛肉',amount:20000,status:'確定',delivery:'9/30頃',orderId:'S-001',source:'sample'},
-      {id:'c1',site:'ふるさとチョイス',city:'□□市',item:'果物',amount:15000,status:'確定',delivery:'10月上旬',orderId:'C-001',source:'sample'},
-      {id:'a1',site:'Amazon等',city:'確認待ち',item:'その他',amount:10000,status:'確認待ち',delivery:'未確定',orderId:'',source:'sample'}
-    ]
+    sourceDocuments:[],
+    donations:[]
   };
   const clone=x=>JSON.parse(JSON.stringify(x));
   function merge(a,b){for(const k in b){if(b[k]&&typeof b[k]==='object'&&!Array.isArray(b[k])&&a[k]&&typeof a[k]==='object'&&!Array.isArray(a[k]))a[k]=merge(a[k],b[k]);else a[k]=b[k]}return a}
@@ -51,7 +46,7 @@ const FurusatoModel = (() => {
       s.forecastBonus=0;
       s.bonusSocialRecords=clone(DEFAULT.bonusSocialRecords);
     }
-    s.schemaVersion=8;
+    s.schemaVersion=10;
     s.importSettings=s.importSettings||{targetYear:s.year||2026,priorYear:(s.year||2026)-1};
     s.importSettings.targetYear=Number(s.importSettings.targetYear)||Number(s.year)||2026;
     s.importSettings.priorYear=s.importSettings.targetYear-1;
@@ -67,6 +62,20 @@ const FurusatoModel = (() => {
     // stale metadata such as the old fixed "through September" default.
     const actualMonths=s.salaryRecords.filter(r=>r.status==='actual' && Number(r.month)>=1 && Number(r.month)<=12 && Number(r.taxableGross)>0).map(r=>Number(r.month));
     s.actualThrough=actualMonths.length?Math.max(...actualMonths):0;
+    // If an old state lost its September row, its old forecast array can still
+    // contain only 3 entries (Oct-Dec). Rebuild the salary/social forecast here
+    // so the newly missing month is included and December cannot fall off the end.
+    if(s.actualThrough>0){
+      const actualRows=s.salaryRecords.filter(r=>r.status==='actual' && Number(r.month)>=4 && Number(r.month)<=Math.min(9,s.actualThrough));
+      const avg=(rows,key)=>{const vals=rows.map(r=>Number(r[key])||0).filter(v=>v>0);return vals.length?Math.round(vals.reduce((a,v)=>a+v,0)/vals.length):0};
+      const salaryAvg=avg(actualRows,'taxableGross');
+      const socialRows=(s.socialRecords||[]).filter(r=>r.status==='actual' && Number(r.month)>=4 && Number(r.month)<=Math.min(9,s.actualThrough));
+      const socialAvg=avg(socialRows,'amount');
+      s.forecastSalary=Array.from({length:Math.max(0,12-s.actualThrough)},()=>salaryAvg);
+      s.forecastSocial=Array.from({length:Math.max(0,12-s.actualThrough)},()=>socialAvg);
+    }else{
+      s.forecastSalary=[]; s.forecastSocial=[];
+    }
     s.taxableAdjustments=Array.isArray(s.taxableAdjustments)?s.taxableAdjustments:[];
     s.deductions=s.deductions||{};
     if(!s.deductions.lifeInsurance)s.deductions.lifeInsurance={newGeneral:0,oldGeneral:0,nursingMedical:0,newPension:0,oldPension:0,source:'manual',needsConfirmation:false};
@@ -79,11 +88,29 @@ const FurusatoModel = (() => {
     s.priorWithholding=s.priorWithholding||null; s.currentWithholding=s.currentWithholding||null;
     s.bonusSocialRecords=Array.isArray(s.bonusSocialRecords)?s.bonusSocialRecords:[];
     if(!s.salaryRecords?.length && Array.isArray(raw?.salary)){
+      // Legacy arrays had no reliable distinction between actual and forecast.
+      // If the old state explicitly recorded actualThrough, preserve only that
+      // boundary; otherwise treat the stored values as actual payroll rows.
       const legacyThrough=Number(raw?.actualThrough);
       s.salaryRecords=raw.salary.map((gross,i)=>({month:i+1,gross,source:'legacy',status:(legacyThrough>0?i+1<=legacyThrough:true)?'actual':'forecast'})).filter(r=>Number(r.gross)>0);
-      const legacyActual=s.salaryRecords.filter(r=>r.status==='actual').map(r=>r.month);
-      s.actualThrough=legacyActual.length?Math.max(...legacyActual):0;
     }
+    // Rebuild the forecast one final time after every migration above.  This is
+    // intentionally after the legacy migration: otherwise a migrated 8-month
+    // state could keep an old 3-month forecast and make December display 0.
+    const rebuildForecast=()=>{
+      const actualMonths=(s.salaryRecords||[]).filter(r=>r.status==='actual'&&Number(r.month)>=1&&Number(r.month)<=12&&Number(r.taxableGross??r.gross)>0).map(r=>Number(r.month));
+      s.actualThrough=actualMonths.length?Math.max(...actualMonths):0;
+      if(!s.actualThrough){s.forecastSalary=[];s.forecastSocial=[];return;}
+      const end=Math.min(9,s.actualThrough);
+      const salaryRows=(s.salaryRecords||[]).filter(r=>r.status==='actual'&&Number(r.month)>=4&&Number(r.month)<=end);
+      const avg=(rows,getter)=>{const vals=rows.map(getter).map(Number).filter(v=>Number.isFinite(v)&&v>0);return vals.length?Math.round(vals.reduce((a,v)=>a+v,0)/vals.length):0};
+      const salaryAvg=avg(salaryRows,r=>r.taxableGross??r.gross);
+      const socialRows=(s.socialRecords||[]).filter(r=>r.status==='actual'&&Number(r.month)>=4&&Number(r.month)<=end);
+      const socialAvg=avg(socialRows,r=>r.amount);
+      s.forecastSalary=Array.from({length:Math.max(0,12-s.actualThrough)},()=>salaryAvg);
+      s.forecastSocial=Array.from({length:Math.max(0,12-s.actualThrough)},()=>socialAvg);
+    };
+    rebuildForecast();
     return s;
   }
   const IMPORT_HISTORY_KEY='furusatoImportHistory';
@@ -98,7 +125,7 @@ const FurusatoModel = (() => {
       let raw=null;
       if(primary){try{raw=JSON.parse(primary)}catch{raw=null}}
       if(!raw&&backup){try{raw=JSON.parse(backup)}catch{raw=null}}
-      const s=normalize(raw);
+      let s=normalize(raw);
       const storeRaw=safeRead(PAYROLL_STORE_KEY);
       if(storeRaw){
         try{
@@ -110,6 +137,9 @@ const FurusatoModel = (() => {
             for(const k of ['salaryRecords','socialRecords','forecastSalary','forecastSocial','bonusRecords','bonusSocialRecords','forecastBonus','priorSalaryRecords','priorSocialRecords','priorBonusRecords','prior','sourceDocuments','importScanCandidates','importFileDetails','importDiagnostics','importSettings']){
               if((s[k]===undefined || (Array.isArray(s[k])&&s[k].length===0)) && store[k]!==undefined)s[k]=clone(store[k]);
             }
+            // Re-normalize after recovery data is merged so actualThrough and
+            // forecasts are rebuilt from the recovered payroll records too.
+            s=normalize(s);
           }
         }catch{}
       }
