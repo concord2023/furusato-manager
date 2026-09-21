@@ -144,7 +144,7 @@ const FurusatoGoogleDrive = (() => {
   // This is deliberately separate from furusatoState: payroll state is the calculation
   // snapshot, while this store is the source-document cache.
   const IMPORT_CACHE_DB='furusatoSourceCache';
-  const IMPORT_CACHE_VERSION='20260921-source-audit-5';
+  const IMPORT_CACHE_VERSION='20260921-source-audit-6';
   function cacheSignature(f){return `${f.id||f.name}|${f.modifiedTime||''}|${f.size||''}`}
   function openImportCache(){return new Promise((resolve,reject)=>{
     if(!('indexedDB' in window))return resolve(null);
@@ -164,7 +164,7 @@ const FurusatoGoogleDrive = (() => {
   const REQUIRED_SOCIAL_COMPONENTS=['employmentInsurance','healthInsurance','healthInsuranceSpecial','nursingCare','childSupport','pension'];
   function socialBreakdownComplete(x){
     const sc=x?.socialComponents||{};
-    return Number.isFinite(Number(x?.social)) && REQUIRED_SOCIAL_COMPONENTS.every(k=>Object.prototype.hasOwnProperty.call(sc,k)&&Number.isFinite(Number(sc[k])));
+    return x?.social!=null && Number.isFinite(Number(x.social)) && REQUIRED_SOCIAL_COMPONENTS.every(k=>Object.prototype.hasOwnProperty.call(sc,k)&&sc[k]!=null&&Number.isFinite(Number(sc[k])));
   }
   function cachedRecordComplete(f,v){
     const type=canonicalCachedType(f,v?.type); const x=v?.x||{};
@@ -325,6 +325,40 @@ const FurusatoGoogleDrive = (() => {
     for(let i=0;i<fullSample.length;i+=4){const v=(fullSample[i]+fullSample[i+1]+fullSample[i+2])/3;fullSum+=v;fullMin=Math.min(fullMin,v);fullMax=Math.max(fullMax,v);if(v<245)fullNonWhite++;}
     const fullPixels=fullSample.length/4;
     // Passing an explicit opaque PNG data URL is more stable on iOS Safari.
+    // Some Toyota payroll PDFs are image-only/table-heavy. Tesseract performs
+    // much better when the table ruling is removed first, especially for the
+    // deduction/social-insurance block. This is opt-in so ordinary full-page OCR
+    // keeps the original pixels.
+    if(options.cleanTable){
+      const img=ctx.getImageData(0,0,cw,ch);
+      const src=new Uint8Array(cw*ch);
+      for(let i=0,p=0;i<img.data.length;i+=4,p++){
+        src[p]=Math.round((img.data[i]*299+img.data[i+1]*587+img.data[i+2]*114)/1000);
+      }
+      const bin=new Uint8Array(src.length);
+      let sum=0; for(let i=0;i<src.length;i++)sum+=src[i];
+      const mean=sum/src.length;
+      for(let i=0;i<src.length;i++)bin[i]=src[i]>(mean*0.92)?255:0;
+      // Remove long horizontal/vertical table lines without erasing the small
+      // strokes used by Japanese glyphs. Work on the binary mask with modest
+      // line lengths relative to the crop.
+      const removeH=Math.max(24,Math.floor(cw*0.12));
+      const removeV=Math.max(18,Math.floor(ch*0.10));
+      const isDark=(x,y)=>bin[y*cw+x]===0;
+      const lineMask=new Uint8Array(bin.length);
+      for(let y=0;y<ch;y++){
+        let run=0;
+        for(let x=0;x<cw;x++){run=isDark(x,y)?run+1:0;if(run>=removeH){for(let k=x-removeH+1;k<=x;k++)lineMask[y*cw+k]=1}}
+      }
+      for(let x=0;x<cw;x++){
+        let run=0;
+        for(let y=0;y<ch;y++){run=isDark(x,y)?run+1:0;if(run>=removeV){for(let k=y-removeV+1;k<=y;k++)lineMask[k*cw+x]=1}}
+      }
+      for(let i=0;i<bin.length;i++)if(lineMask[i])bin[i]=255;
+      const out=ctx.createImageData(cw,ch);
+      for(let i=0,p=0;i<out.data.length;i+=4,p++){const v=bin[p];out.data[i]=v;out.data[i+1]=v;out.data[i+2]=v;out.data[i+3]=255}
+      ctx.putImageData(out,0,0);
+    }
     const imageDataUrl=canvas.toDataURL('image/png');
     // Keep the FULL PAGE as the user-facing preview/save image. Region OCR is
     // intentionally allowed to run for parsing, but must never replace the
@@ -368,8 +402,17 @@ const FurusatoGoogleDrive = (() => {
       if(ocrQuality(firstText,Math.max(...attempts.map(x=>Number(x.ocrConfidence||0))))<260){
         attempts.push(await ocrPageFromPdfDoc(base.pdfDoc,null,{scale:2.5,psm:11,lang:'eng'}));
       }
-      if(type==='salary' && ocrQuality(attempts.map(x=>x.text).join('\n'),Math.max(...attempts.map(x=>x.ocrConfidence||0)))<260){
-        attempts.push(await ocrPageFromPdfDoc(base.pdfDoc,{x0:0,y0:0.68,x1:0.75,y1:1},{scale:2.5,psm:11,lang:'jpn'}));
+      let salarySocialRegion=null, salarySummaryRegion=null;
+      if(type==='salary'){
+        // Different view of the problem: these older Toyota slips can be image-only,
+        // and full-page OCR is unreliable because the table ruling dominates the page.
+        // OCR the two numeric blocks directly after removing the ruling lines.
+        try{salarySocialRegion=await ocrPageFromPdfDoc(base.pdfDoc,{x0:.21,y0:.22,x1:.43,y1:.55},{scale:4,psm:6,lang:'jpn+eng',cleanTable:true});attempts.push(salarySocialRegion)}catch(e){diag({stage:'ocrRegionError',type,name,region:'salarySocial',error:e?.message||String(e)})}
+        try{salarySummaryRegion=await ocrPageFromPdfDoc(base.pdfDoc,{x0:.00,y0:.80,x1:.48,y1:1},{scale:4,psm:6,lang:'jpn+eng',cleanTable:true});attempts.push(salarySummaryRegion)}catch(e){diag({stage:'ocrRegionError',type,name,region:'salarySummary',error:e?.message||String(e)})}
+      } else if(ocrQuality(attempts.map(x=>x.text).join('\n'),Math.max(...attempts.map(x=>x.ocrConfidence||0)))<260){
+        // Numeric fields on non-salary documents can still benefit from the
+        // English fallback, but salary now uses the dedicated table crops above.
+        attempts.push(await ocrPageFromPdfDoc(base.pdfDoc,null,{scale:2.5,psm:11,lang:'eng'}));
       }
       const nonEmpty=attempts.filter(x=>String(x.text||'').trim().length>=20);
       if(!nonEmpty.length)throw new Error('OCR結果が空または短すぎます');
@@ -397,7 +440,7 @@ const FurusatoGoogleDrive = (() => {
       const wordSource=valid.find(x=>!x.ocrRegion&&Array.isArray(x.words)&&x.words.length)
         ||nonEmpty.find(x=>!x.ocrRegion&&Array.isArray(x.words)&&x.words.length)
         ||best;
-      return {...base,text:mergedText,ocrText:mergedText,ocrUsed:true,ocrConfidence:Math.max(...attempts.map(x=>Number(x.ocrConfidence||0))),ocrPsm:attempts.map(x=>x.ocrPsm).join(','),ocrWords:wordSource.words||[],ocrWordCount:Array.isArray(wordSource.words)?wordSource.words.length:0,ocrWidth:wordSource.ocrWidth,ocrHeight:wordSource.ocrHeight,ocrAttempts:attempts.map(x=>({psm:x.ocrPsm,lang:x.ocrLang,chars:String(x.text||'').length,confidence:x.ocrConfidence||0,words:Array.isArray(x.words)?x.words.length:0,valid:valid.includes(x)})),ocrValidated:valid.length>0};
+      return {...base,text:mergedText,ocrText:mergedText,ocrUsed:true,ocrConfidence:Math.max(...attempts.map(x=>Number(x.ocrConfidence||0))),ocrPsm:attempts.map(x=>x.ocrPsm).join(','),ocrWords:wordSource.words||[],ocrWordCount:Array.isArray(wordSource.words)?wordSource.words.length:0,ocrWidth:wordSource.ocrWidth,ocrHeight:wordSource.ocrHeight,ocrAttempts:attempts.map(x=>({psm:x.ocrPsm,lang:x.ocrLang,chars:String(x.text||'').length,confidence:x.ocrConfidence||0,words:Array.isArray(x.words)?x.words.length:0,valid:valid.includes(x)})),ocrValidated:valid.length>0,ocrRegions:type==='salary'?{salarySocial:salarySocialRegion,salarySummary:salarySummaryRegion}:undefined};
     }catch(e){diag({stage:'ocrError',type,name,error:e?.stack||e?.message||String(e),attempts:attempts.map(x=>({psm:x.ocrPsm,lang:x.ocrLang,chars:String(x.text||'').length,confidence:x.ocrConfidence||0,words:Array.isArray(x.words)?x.words.length:0,sample:String(x.text||'').slice(0,300),width:x.ocrWidth||0,height:x.ocrHeight||0,imageBytes:x.imageBytes||0,cornerNonWhite:x.cornerNonWhite||0,cornerMean:x.cornerMean||0}))});return {...base,text:raw,ocrText:'',ocrUsed:true,ocrError:e?.message||String(e),ocrAttempts:attempts.map(x=>({psm:x.ocrPsm,lang:x.ocrLang,chars:String(x.text||'').length,confidence:x.ocrConfidence||0,words:Array.isArray(x.words)?x.words.length:0,valid:false})),ocrValidated:false};}
     return {...base,text:raw,ocrUsed:true,ocrError:'OCR結果が空でした'};
   }
@@ -718,7 +761,7 @@ const FurusatoGoogleDrive = (() => {
     return extractNumericTokens(raw).map(x=>x.n).filter(n=>n<1000000000&&!(n>=1900&&n<=2100));
   }
   function ocrWordNumbers(textOrPdf){
-    const words=Array.isArray(textOrPdf?.ocrWords)?textOrPdf.ocrWords:[];
+    const words=Array.isArray(textOrPdf?.ocrWords)?textOrPdf.ocrWords:(Array.isArray(textOrPdf?.words)?textOrPdf.words:[]);
     const raw=[];
     for(const w of words){
       const text=String(w?.text||w?.str||'').trim(); if(!text)continue;
@@ -761,10 +804,18 @@ const FurusatoGoogleDrive = (() => {
     return nums.filter(n=>n.x>=x0&&n.x1<=x1&&n.y>=y0&&n.y<=y1).sort((a,b)=>a.y-b.y||a.x-b.x);
   }
   function ocrPayrollFallback(textOrPdf,type){
-    if(!textOrPdf?.ocrUsed||!Array.isArray(textOrPdf?.ocrWords)||!textOrPdf.ocrWords.length)return null;
+    const hasTopWords=Array.isArray(textOrPdf?.ocrWords)&&textOrPdf.ocrWords.length>0;
+    const hasSalaryRegions=type==='salary'&&Array.isArray(textOrPdf?.ocrRegions?.salarySocial?.words)&&textOrPdf.ocrRegions.salarySocial.words.length>0;
+    if(!textOrPdf?.ocrUsed||(!hasTopWords&&!hasSalaryRegions))return null;
     if(type==='salary'){
-      const summary=ocrRegionNumbers(textOrPdf,{x0:.16,x1:.34,y0:.84,y1:1});
-      const social=ocrRegionNumbers(textOrPdf,{x0:.36,x1:.47,y0:.24,y1:.46});
+      const summarySource=textOrPdf?.ocrRegions?.salarySummary||textOrPdf;
+      const socialSource=textOrPdf?.ocrRegions?.salarySocial||textOrPdf;
+      const summary=Array.isArray(textOrPdf?.ocrRegions?.salarySummary?.words)
+        ? ocrWordNumbers(summarySource)
+        : ocrRegionNumbers(summarySource,{x0:.16,x1:.34,y0:.84,y1:1});
+      const social=Array.isArray(textOrPdf?.ocrRegions?.salarySocial?.words)
+        ? ocrWordNumbers(socialSource)
+        : ocrRegionNumbers(socialSource,{x0:.21,x1:.50,y0:.22,y1:.55});
       const byY=[]; for(const n of social){let g=byY.find(v=>Math.abs(v.y-n.y)<12);if(!g){g={y:n.y,n:n.n};byY.push(g)}else if(String(n.n).length>=String(g.n).length)g.n=n.n;}
       const vals=byY.sort((a,b)=>a.y-b.y).map(x=>x.n);
       const svals=summary.sort((a,b)=>a.y-b.y).map(x=>x.n);
@@ -872,12 +923,22 @@ const FurusatoGoogleDrive = (() => {
       // Prefer exact PDF text values over OCR. OCR is only a recovery path for
       // fields that the PDF text layer did not yield; otherwise a noisy OCR pass
       // could overwrite a correct taxable amount and make a valid salary fail.
+      const socialKeys=REQUIRED_SOCIAL_COMPONENTS;
+      const mergedSocial={};
+      for(const k of socialKeys){
+        const cv=c.socialComponents?.[k];
+        const ov=o.socialComponents?.[k];
+        const fv=f.socialComponents?.[k];
+        mergedSocial[k]=cv!=null&&Number.isFinite(Number(cv))?Number(cv):(ov!=null&&Number.isFinite(Number(ov))?Number(ov):(fv!=null&&Number.isFinite(Number(fv))?Number(fv):null));
+      }
+      const mergedSocialVals=socialKeys.map(k=>mergedSocial[k]);
+      const mergedSocialTotal=mergedSocialVals.every(v=>Number.isFinite(v))?mergedSocialVals.reduce((a,v)=>a+v,0):null;
       c={...c,
         taxableGross:c.taxableGross??o.taxableGross??f.taxableGross,
         grossTotal:c.grossTotal??o.grossTotal??f.grossTotal,
         nonTaxableTotal:c.nonTaxableTotal??o.nonTaxableTotal??f.nonTaxableTotal,
-        socialTotal:c.socialTotal??o.socialTotal??f.socialTotal,
-        socialComponents:(c.socialComponents&&Object.values(c.socialComponents).some(v=>Number.isFinite(v)))?c.socialComponents:(o.socialComponents&&Object.values(o.socialComponents).some(v=>Number.isFinite(v)))?o.socialComponents:(f.socialComponents??c.socialComponents)
+        socialTotal:mergedSocialTotal??c.socialTotal??o.socialTotal??f.socialTotal,
+        socialComponents:mergedSocial
       };
       if(!c.components?.length&&o.grossComponents?.length)c={...c,grossComponents:o.grossComponents};
       if(c.taxableGross!=null&&c.nonTaxableTotal!=null&&c.grossTotal==null)c.grossTotal=c.taxableGross+c.nonTaxableTotal;
