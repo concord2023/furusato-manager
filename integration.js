@@ -102,9 +102,23 @@ const FurusatoGoogleDrive = (() => {
     const currentYear=Number(targetYear)||new Date().getFullYear();
     const priorYear=currentYear-1;
     const years=[priorYear,currentYear];
-    const q=`trashed = false and mimeType = 'application/pdf' and name contains '${EMPLOYEE_ID}'`;
+    // Do not rely on Drive MIME metadata: PDFs uploaded/synced by some services
+    // can be reported as application/octet-stream. Run two independent searches
+    // and merge by file ID. The employee number remains the fixed search condition.
+    const queries=[
+      `trashed = false and name contains '${EMPLOYEE_ID}'`,
+      `trashed = false and fullText contains '${EMPLOYEE_ID}'`
+    ];
     let rows=[];
-    try{rows=await listAllFilesByQuery(q)}catch(e){throw new Error(`Google Drive検索に失敗しました: ${e.message||e}`)}
+    try{
+      const batches=await Promise.all(queries.map(q=>listAllFilesByQuery(q)));
+      const merged=new Map();
+      for(const batch of batches)for(const f of batch){
+        const key=String(f.id||`${f.name}|${f.modifiedTime||''}`);
+        if(!merged.has(key))merged.set(key,f);
+      }
+      rows=[...merged.values()];
+    }catch(e){throw new Error(`Google Drive検索に失敗しました: ${e.message||e}`)}
     const out=[]; const seen=new Set();
     for(const f of rows){
       const name=String(f.name||'');
@@ -130,7 +144,7 @@ const FurusatoGoogleDrive = (() => {
   // This is deliberately separate from furusatoState: payroll state is the calculation
   // snapshot, while this store is the source-document cache.
   const IMPORT_CACHE_DB='furusatoSourceCache';
-  const IMPORT_CACHE_VERSION='20260921-source-audit-3';
+  const IMPORT_CACHE_VERSION='20260921-source-audit-4';
   function cacheSignature(f){return `${f.id||f.name}|${f.modifiedTime||''}|${f.size||''}`}
   function openImportCache(){return new Promise((resolve,reject)=>{
     if(!('indexedDB' in window))return resolve(null);
@@ -812,7 +826,12 @@ const FurusatoGoogleDrive = (() => {
       pension:['年金保険料','厚生年金保険料']
     };
     const socialComponents={};
-    for(const [k,labels] of Object.entries(socialLabels)) socialComponents[k]=extractExactYenAfterLabel(text,labels);
+    for(const [k,labels] of Object.entries(socialLabels)){
+      // Primary parser uses exact text order. If the PDF text stream has the
+      // value/label order split by columns, fall back to the layout-aware
+      // extractor instead of silently losing that insurance item.
+      socialComponents[k]=extractExactYenAfterLabel(text,labels) ?? extractLabeledNumber(text,labels);
+    }
     const socialValues=Object.values(socialComponents);
     const socialTotal=socialValues.every(v=>Number.isFinite(v))?socialValues.reduce((a,v)=>a+v,0):null;
     const grossComponents=[];
