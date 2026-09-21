@@ -42,6 +42,7 @@ const FurusatoGoogleDrive = (() => {
   let lastOcrImageDataUrl=null;
   function diag(entry){try{runtimeDiagnostics.push({...entry,at:new Date().toISOString()});if(runtimeDiagnostics.length>80)runtimeDiagnostics.splice(0,runtimeDiagnostics.length-80)}catch{}}
   function getRuntimeDiagnostics(){return runtimeDiagnostics.slice()}
+  function persistImportProgress(state){try{if(window.FurusatoModel?.save)window.FurusatoModel.save(state);else{const json=JSON.stringify(state);localStorage.setItem('furusatoState',json);localStorage.setItem('furusatoStateBackup',json);localStorage.setItem('furusatoImportHistory',JSON.stringify(Array.isArray(state.importHistory)?state.importHistory.slice(0,200):[]));}}catch(e){diag({stage:'persistImportProgressError',error:e?.message||String(e)})}}
   function clearRuntimeDiagnostics(){runtimeDiagnostics.length=0}
   function getClientId(){return localStorage.getItem(CLIENT_KEY)||''}
   function setClientId(v){const x=String(v||'').trim(); if(x)localStorage.setItem(CLIENT_KEY,x); else localStorage.removeItem(CLIENT_KEY); return x}
@@ -144,7 +145,7 @@ const FurusatoGoogleDrive = (() => {
   // This is deliberately separate from furusatoState: payroll state is the calculation
   // snapshot, while this store is the source-document cache.
   const IMPORT_CACHE_DB='furusatoSourceCache';
-  const IMPORT_CACHE_VERSION='20260921-source-audit-8';
+  const IMPORT_CACHE_VERSION='20260922-import-persist-1';
   const IMPORT_CACHE_DB_VERSION=3;
   function cacheSignature(f){return `${f.id||f.name}|${f.modifiedTime||''}|${f.size||''}`}
   function openImportCache(){return new Promise((resolve,reject)=>{
@@ -448,11 +449,24 @@ const FurusatoGoogleDrive = (() => {
       }
       let salarySocialRegion=null, salarySummaryRegion=null;
       if(type==='salary'){
-        // Different view of the problem: these older Toyota slips can be image-only,
-        // and full-page OCR is unreliable because the table ruling dominates the page.
-        // OCR the two numeric blocks directly after removing the ruling lines.
-        try{salarySocialRegion=await ocrPageFromPdfDoc(base.pdfDoc,{x0:.30,y0:.235,x1:.46,y1:.55},{scale:4,psm:6,lang:'eng'});attempts.push(salarySocialRegion)}catch(e){diag({stage:'ocrRegionError',type,name,region:'salarySocial',error:e?.message||String(e)})}
-        try{salarySummaryRegion=await ocrPageFromPdfDoc(base.pdfDoc,{x0:.00,y0:.80,x1:.48,y1:1},{scale:4,psm:6,lang:'eng'});attempts.push(salarySummaryRegion)}catch(e){diag({stage:'ocrRegionError',type,name,region:'salarySummary',error:e?.message||String(e)})}
+        // Do NOT gate this on the quality of the overall text layer. A payroll PDF
+        // can yield a perfectly good taxable salary while the social-insurance
+        // column is missing from its text layer. Inspect the numeric deduction
+        // column on every salary PDF and keep the actual crop in IndexedDB.
+        const crops=[
+          {x0:.28,y0:.20,x1:.48,y1:.62},
+          {x0:.30,y0:.22,x1:.46,y1:.60},
+          {x0:.31,y0:.24,x1:.45,y1:.58}
+        ];
+        const rs=[];
+        for(const r of crops){try{const z=await ocrPageFromPdfDoc(base.pdfDoc,r,{scale:4,psm:6,lang:'eng',cleanTable:true});rs.push(z);attempts.push(z)}catch(e){diag({stage:'ocrRegionError',type,name,region:'salarySocial',crop:r,error:e?.message||String(e)})}}
+        const countNums=z=>{try{return ocrWordNumbers(z).map(v=>v.n).filter(n=>n>=100&&n<1000000).length}catch{return 0}};
+        rs.sort((a,b)=>countNums(b)-countNums(a)); salarySocialRegion=rs[0]||null;
+        try{salarySummaryRegion=await ocrPageFromPdfDoc(base.pdfDoc,{x0:.00,y0:.78,x1:.50,y1:1},{scale:4,psm:6,lang:'eng',cleanTable:true});attempts.push(salarySummaryRegion)}catch(e){diag({stage:'ocrRegionError',type,name,region:'salarySummary',error:e?.message||String(e)})}
+        const socialNums=salarySocialRegion?ocrWordNumbers(salarySocialRegion).map(v=>v.n).filter(n=>n>=100&&n<1000000):[];
+        if(socialNums.length>=6){
+          return {...base,text:String(base.text||'')+'\n'+String(salarySocialRegion.text||''),ocrText:String(salarySocialRegion.text||''),ocrUsed:true,ocrConfidence:Number(salarySocialRegion.ocrConfidence||0),ocrPsm:String(salarySocialRegion.ocrPsm||''),ocrLang:'eng',ocrWords:salarySocialRegion.words||[],ocrWordCount:Array.isArray(salarySocialRegion.words)?salarySocialRegion.words.length:0,ocrWidth:salarySocialRegion.ocrWidth,ocrHeight:salarySocialRegion.ocrHeight,ocrAttempts:attempts.map(x=>({psm:x.ocrPsm,lang:x.ocrLang,chars:String(x.text||'').length,confidence:x.ocrConfidence||0,words:Array.isArray(x.words)?x.words.length:0,valid:false})),ocrValidated:false,ocrRegions:{salarySocial:salarySocialRegion,salarySummary:salarySummaryRegion},ocrDebugImages:{full:null,salarySocial:salarySocialRegion?.imageDataUrl||null,salarySummary:salarySummaryRegion?.imageDataUrl||null}};
+        }
       } else if(ocrQuality(attempts.map(x=>x.text).join('\n'),Math.max(...attempts.map(x=>x.ocrConfidence||0)))<260){
         // Numeric fields on non-salary documents can still benefit from the
         // English fallback, but salary now uses the dedicated table crops above.
@@ -1326,7 +1340,7 @@ const FurusatoGoogleDrive = (() => {
     const targetYear=Number(state.importSettings?.targetYear||state.year||new Date().getFullYear()); const priorYear=targetYear-1; state.year=targetYear;
     const allFiles=Array.isArray(filesOverride)?filesOverride:await listCandidateFiles(targetYear);
     const files=neededCandidates(allFiles,state,targetYear,priorYear);
-    const result={files:files.length,discoveredFiles:allFiles.length,added:0,review:0,skipped:0,cacheHits:0,cacheMisses:0,downloads:0,parsed:0,errors:[],salaryCandidates:files.filter(f=>f.candidateType==='salary').length,salaryImported:0,salaryReview:0,salaryParsed:0,salaryOcr:0,salaryRejected:0,candidates:files.map(f=>({name:f.name,type:f.candidateType,year:f.filenameYear}))}; state.importHistory=Array.isArray(state.importHistory)?state.importHistory:[]; state.importFileDetails=[];
+    const result={files:files.length,discoveredFiles:allFiles.length,added:0,review:0,skipped:0,cacheHits:0,cacheMisses:0,downloads:0,parsed:0,errors:[],salaryCandidates:files.filter(f=>f.candidateType==='salary').length,salaryImported:0,salaryReview:0,salaryParsed:0,salaryOcr:0,salaryRejected:0,candidates:files.map(f=>({name:f.name,type:f.candidateType,year:f.filenameYear}))}; state.importHistory=Array.isArray(state.importHistory)?state.importHistory:[]; state.importFileDetails=[]; state.importRun={running:true,startedAt:new Date().toISOString(),targetYear,priorYear,total:files.length,completed:0,current:null}; persistImportProgress(state);
     state.priorSalaryRecords=(state.priorSalaryRecords||[]).filter(x=>Number(x.year)===priorYear); state.priorBonusRecords=(state.priorBonusRecords||[]).filter(x=>Number(x.year)===priorYear); state.priorSocialRecords=(state.priorSocialRecords||[]).filter(x=>Number(x.year)===priorYear);
     state.salaryRecords=(state.salaryRecords||[]).filter(x=>x.source==='manual'||Number(x.year||targetYear)===targetYear);
     state.bonusRecords=(state.bonusRecords||[]).filter(x=>x.source==='manual'||Number(x.year||String(x.date||'').slice(0,4))===targetYear);
@@ -1367,9 +1381,10 @@ const FurusatoGoogleDrive = (() => {
           if(x.needsReview) result.review++;
           else result.added++;
         }else {result.skipped++;state.importHistory.unshift({at:new Date().toISOString(),name:f.name,type:type||f.candidateType||'other',year:f.filenameYear||null,status:'対象外'});}
-      }catch(e){result.errors.push(`${f.name}: ${e.message}`);recordHistory(state,{at:new Date().toISOString(),name:f.name,type:f.candidateType||'other',year:f.filenameYear||null,status:'エラー',reason:e.message});}
+        state.importRun={...(state.importRun||{}),completed:Number(state.importRun?.completed||0)+1,current:f.name}; persistImportProgress(state);
+      }catch(e){result.errors.push(`${f.name}: ${e.message}`);recordHistory(state,{at:new Date().toISOString(),name:f.name,type:f.candidateType||'other',year:f.filenameYear||null,status:'エラー',reason:e.message});state.importRun={...(state.importRun||{}),completed:Number(state.importRun?.completed||0)+1,current:f.name,error:e.message};persistImportProgress(state);}
     }
-    rebuildPriorSummary(state,priorYear); const actualThrough=deriveActualThrough(state,targetYear); buildForecastFromPrior(state,targetYear,actualThrough); state.importDiagnostics={at:new Date().toISOString(),targetYear,actualThrough,files:result.files,discoveredFiles:result.discoveredFiles,cacheHits:result.cacheHits,cacheMisses:result.cacheMisses,downloads:result.downloads,parsed:result.parsed,salaryCandidates:result.salaryCandidates,salaryImported:result.salaryImported,salaryParsed:result.salaryParsed,salaryOcr:result.salaryOcr,salaryRejected:result.salaryRejected,errors:result.errors.slice(),fileDetails:state.importFileDetails||[],runtimeReadout:runtimeDiagnostics.slice()}; state.importHistory=state.importHistory.filter(x=>{const y=Number(x?.year||0);return !y||y===targetYear||y===priorYear}).slice(0,200); state.importSettings={...(state.importSettings||{}),targetYear,priorYear};
+    rebuildPriorSummary(state,priorYear); const actualThrough=deriveActualThrough(state,targetYear); buildForecastFromPrior(state,targetYear,actualThrough); state.importDiagnostics={at:new Date().toISOString(),targetYear,actualThrough,files:result.files,discoveredFiles:result.discoveredFiles,cacheHits:result.cacheHits,cacheMisses:result.cacheMisses,downloads:result.downloads,parsed:result.parsed,salaryCandidates:result.salaryCandidates,salaryImported:result.salaryImported,salaryParsed:result.salaryParsed,salaryOcr:result.salaryOcr,salaryRejected:result.salaryRejected,errors:result.errors.slice(),fileDetails:state.importFileDetails||[],runtimeReadout:runtimeDiagnostics.slice()}; state.importHistory=state.importHistory.filter(x=>{const y=Number(x?.year||0);return !y||y===targetYear||y===priorYear}).slice(0,200); state.importSettings={...(state.importSettings||{}),targetYear,priorYear}; state.importRun={...(state.importRun||{}),running:false,finishedAt:new Date().toISOString(),completed:files.length,current:null,result:{files:result.files,discoveredFiles:result.discoveredFiles,cacheHits:result.cacheHits,cacheMisses:result.cacheMisses,downloads:result.downloads,parsed:result.parsed,added:result.added,review:result.review,skipped:result.skipped,salaryCandidates:result.salaryCandidates,salaryImported:result.salaryImported,salaryParsed:result.salaryParsed,salaryOcr:result.salaryOcr,salaryRejected:result.salaryRejected,errors:result.errors.length}}; persistImportProgress(state);
     return result;
   }
   async function getCachedSourceEntries(){const db=await openImportCache();if(!db)return[];return new Promise(resolve=>{try{const tx=db.transaction('files','readonly'),st=tx.objectStore('files'),q=st.getAll();q.onsuccess=()=>resolve(q.result||[]);q.onerror=()=>resolve([])}catch{resolve([])}})}
