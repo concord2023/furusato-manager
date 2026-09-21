@@ -91,20 +91,18 @@ const FurusatoGoogleDrive = (() => {
     }while(pageToken);
     return out;
   }
-  // Search by document type keywords rather than a person/company-specific
-  // employee number. This keeps the importer reusable when payroll PDFs use
-  // a different filename convention. Only the target year and immediately
-  // preceding year are considered before any PDF is downloaded.
-  const DEFAULT_SOURCE_KEYWORDS=['給与','賃金','明細','賞与','ボーナス','源泉徴収','源泉','Chinginmeisai','chinginmeisai','chingin','salary','payroll','bonus','withholding'];
+  // IMPORTANT: 1219856 is the user's fixed Drive search condition. Do not add
+  // a second filename-keyword condition here. Toyota's files use several naming
+  // patterns (Chinginmeisai / Gensen / Bonus), and a keyword query can silently
+  // return only one family of documents. First retrieve every PDF whose name
+  // contains 1219856, then classify locally and keep only the target/prior years.
+  const EMPLOYEE_ID='1219856';
   async function listCandidateFiles(targetYear){
     if(!accessToken)await authorize();
     const currentYear=Number(targetYear)||new Date().getFullYear();
     const priorYear=currentYear-1;
     const years=[priorYear,currentYear];
-    const keywords=Array.isArray(window.furusatoImportKeywords)&&window.furusatoImportKeywords.length?window.furusatoImportKeywords:DEFAULT_SOURCE_KEYWORDS;
-    const clauses=keywords.map(k=>`name contains '${String(k).replace(/'/g,"\\'")}'`);
-    const employeeId='1219856';
-    const q=`trashed = false and mimeType = 'application/pdf' and name contains '${employeeId}' and (${clauses.join(' or ')})`;
+    const q=`trashed = false and mimeType = 'application/pdf' and name contains '${EMPLOYEE_ID}'`;
     let rows=[];
     try{rows=await listAllFilesByQuery(q)}catch(e){throw new Error(`Google Drive検索に失敗しました: ${e.message||e}`)}
     const out=[]; const seen=new Set();
@@ -113,9 +111,14 @@ const FurusatoGoogleDrive = (() => {
       const isPdf=/\.pdf$/i.test(name)||f.mimeType==='application/pdf';
       if(!isPdf)continue;
       let y=yearFromName(name);
-      if(y===null && candidateTypeFromName(name)==='withholding'){ const m=String(name).match(/(20\d{2})(0[1-9]|1[0-2])/); if(m)y=Number(m[1]); }
+      if(y===null && candidateTypeFromName(name)==='withholding'){
+        const m=name.match(/(20\d{2})(0[1-9]|1[0-2])/); if(m)y=Number(m[1]);
+      }
       if(y===null || !years.includes(y))continue;
       const type=candidateTypeFromName(name);
+      // Only known payroll document families enter the parse queue. This avoids
+      // downloading unrelated 1219856 PDFs while still covering every known
+      // salary/bonus/withholding naming pattern.
       if(type==='unknown')continue;
       const key=String(f.id||name); if(seen.has(key))continue; seen.add(key);
       out.push({...f,candidate:true,candidateType:type,filenameYear:y});
@@ -127,7 +130,7 @@ const FurusatoGoogleDrive = (() => {
   // This is deliberately separate from furusatoState: payroll state is the calculation
   // snapshot, while this store is the source-document cache.
   const IMPORT_CACHE_DB='furusatoSourceCache';
-  const IMPORT_CACHE_VERSION='20260921-source-audit-1';
+  const IMPORT_CACHE_VERSION='20260921-source-audit-3';
   function cacheSignature(f){return `${f.id||f.name}|${f.modifiedTime||''}|${f.size||''}`}
   function openImportCache(){return new Promise((resolve,reject)=>{
     if(!('indexedDB' in window))return resolve(null);
@@ -144,20 +147,21 @@ const FurusatoGoogleDrive = (() => {
     if(storedType==='bonus')return 'bonus_slip';
     return storedType||'unknown';
   }
+  const REQUIRED_SOCIAL_COMPONENTS=['employmentInsurance','healthInsurance','healthInsuranceSpecial','nursingCare','childSupport','pension'];
+  function socialBreakdownComplete(x){
+    const sc=x?.socialComponents||{};
+    return Number.isFinite(Number(x?.social)) && REQUIRED_SOCIAL_COMPONENTS.every(k=>Object.prototype.hasOwnProperty.call(sc,k)&&Number.isFinite(Number(sc[k])));
+  }
   function cachedRecordComplete(f,v){
     const type=canonicalCachedType(f,v?.type); const x=v?.x||{};
     if(type==='withholding'){
       return !!(x.year&&Number(x.annualSalary)>0&&Number(x.incomeTax)>=0&&Number(x.social)>=0&&Number(x.deductionsTotal)>=0&&x.arithmeticOk&&!x.needsReview);
     }
     if(type==='salary_slip'){
-      const sc=x.socialComponents||{};
-      const socialComplete=Number.isFinite(Number(x.social))&&Object.keys(sc).length>=6&&Object.values(sc).slice(0,6).every(v=>Number.isFinite(Number(v)));
-      return !!(x.year&&x.month&&Number(x.taxableGross)>0&&socialComplete&&!x.needsReview);
+      return !!(x.year&&x.month&&Number(x.taxableGross)>0&&socialBreakdownComplete(x)&&!x.needsReview);
     }
     if(type==='bonus_slip'){
-      const sc=x.socialComponents||{};
-      const socialComplete=Number.isFinite(Number(x.social))&&Object.keys(sc).length>=6&&Object.values(sc).slice(0,6).every(v=>Number.isFinite(Number(v)));
-      return !!(x.year&&x.date&&Number(x.amount)>0&&socialComplete&&x.season&&!x.needsReview);
+      return !!(x.year&&x.date&&Number(x.amount)>0&&socialBreakdownComplete(x)&&x.season&&!x.needsReview);
     }
     return true;
   }
