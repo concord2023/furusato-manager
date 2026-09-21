@@ -145,7 +145,7 @@ const FurusatoGoogleDrive = (() => {
   // This is deliberately separate from furusatoState: payroll state is the calculation
   // snapshot, while this store is the source-document cache.
   const IMPORT_CACHE_DB='furusatoSourceCache';
-  const IMPORT_CACHE_VERSION='20260922-import-persist-1';
+  const IMPORT_CACHE_VERSION='20260922-import-persist-2';
   const IMPORT_CACHE_DB_VERSION=3;
   function cacheSignature(f){return `${f.id||f.name}|${f.modifiedTime||''}|${f.size||''}`}
   function openImportCache(){return new Promise((resolve,reject)=>{
@@ -163,10 +163,12 @@ const FurusatoGoogleDrive = (() => {
     if(storedType==='bonus')return 'bonus_slip';
     return storedType||'unknown';
   }
-  const REQUIRED_SOCIAL_COMPONENTS=['employmentInsurance','healthInsurance','healthInsuranceSpecial','nursingCare','childSupport','pension'];
+  const REQUIRED_SOCIAL_COMPONENTS=['employmentInsurance','healthInsurance','healthInsuranceSpecial','nursingCare','pension'];
   function socialBreakdownComplete(x){
     const sc=x?.socialComponents||{};
-    return x?.social!=null && Number.isFinite(Number(x.social)) && REQUIRED_SOCIAL_COMPONENTS.every(k=>Object.prototype.hasOwnProperty.call(sc,k)&&sc[k]!=null&&Number.isFinite(Number(sc[k])));
+    const requiredOk=REQUIRED_SOCIAL_COMPONENTS.every(k=>Object.prototype.hasOwnProperty.call(sc,k)&&sc[k]!=null&&Number.isFinite(Number(sc[k])));
+    const childSupportOk=!Object.prototype.hasOwnProperty.call(sc,'childSupport')||sc.childSupport==null||Number.isFinite(Number(sc.childSupport));
+    return x?.social!=null && Number.isFinite(Number(x.social)) && requiredOk && childSupportOk;
   }
   function cachedRecordComplete(f,v){
     const type=canonicalCachedType(f,v?.type); const x=v?.x||{};
@@ -205,6 +207,16 @@ const FurusatoGoogleDrive = (() => {
     }catch{return null}
   }
   function blobToDataUrl(blob){return new Promise(resolve=>{if(!blob)return resolve('');try{const r=new FileReader();r.onload=()=>resolve(String(r.result||''));r.onerror=()=>resolve('');r.readAsDataURL(blob)}catch{resolve('')}})}
+  async function renderDebugRegionFromPdfDoc(doc,region,scale=4){
+    if(!doc||typeof document==='undefined')return null;
+    const page=await doc.getPage(1); const viewport=page.getViewport({scale});
+    const sx=Math.max(0,Math.min(1,Number(region.x0)||0)),sy=Math.max(0,Math.min(1,Number(region.y0)||0));
+    const ex=Math.max(sx,Math.min(1,Number(region.x1)==null?1:Number(region.x1))),ey=Math.max(sy,Math.min(1,Number(region.y1)==null?1:Number(region.y1)));
+    const canvas=document.createElement('canvas'); canvas.width=Math.max(1,Math.round(viewport.width*(ex-sx))); canvas.height=Math.max(1,Math.round(viewport.height*(ey-sy)));
+    const ctx=canvas.getContext('2d'); if(!ctx)return null; ctx.fillStyle='#fff';ctx.fillRect(0,0,canvas.width,canvas.height);
+    await page.render({canvasContext:ctx,viewport,background:'#fff',transform:[1,0,0,1,-viewport.width*sx,-viewport.height*sy]}).promise;
+    return canvas.toDataURL('image/png');
+  }
   async function saveDebugImageRecord(f,region,dataUrl){
     if(!dataUrl)return false; const db=await openImportCache(); if(!db)return false;
     const blob=dataUrlToBlob(dataUrl); if(!blob)return false;
@@ -427,11 +439,20 @@ const FurusatoGoogleDrive = (() => {
     const minChars=type==='withholding'?80:(type==='bonus'?100:120);
     let structuralOk=(base.textItemCount||0)>=8 && raw.length>=minChars;
     try{
-      if(type==='salary'){const q=parseSalaryComponents(base);const socialOk=Object.values(q.socialComponents||{}).length===6&&Object.values(q.socialComponents||{}).every(v=>Number.isFinite(Number(v)));structuralOk=structuralOk&&q.taxableGross!=null&&!q.needsReview&&socialOk;}
+      if(type==='salary'){const q=parseSalaryComponents(base);const sc=q.socialComponents||{};const socialOk=REQUIRED_SOCIAL_COMPONENTS.every(k=>Number.isFinite(Number(sc[k])))&&(sc.childSupport==null||Number.isFinite(Number(sc.childSupport)));structuralOk=structuralOk&&q.taxableGross!=null&&!q.needsReview&&socialOk;}
       else if(type==='bonus'){const q=parseBonusPdf(base,name);structuralOk=structuralOk&&q.date&&q.amount!=null&&!q.needsReview;}
       else if(type==='withholding'){const q=parseWithholdingPdf(base,name);structuralOk=structuralOk&&q.year!=null&&q.annualSalary!=null&&q.incomeTax!=null&&q.social!=null&&!q.needsReview;}
     }catch{structuralOk=false}
-    if(structuralOk)return base;
+    if(structuralOk){
+      if(type==='salary'&&base.pdfDoc){
+        try{
+          const salarySocial=await renderDebugRegionFromPdfDoc(base.pdfDoc,{x0:.28,y0:.20,x1:.48,y1:.62},4);
+          const salarySummary=await renderDebugRegionFromPdfDoc(base.pdfDoc,{x0:0,y0:.78,x1:.50,y1:1},4);
+          return {...base,ocrDebugImages:{full:null,salarySocial,salarySummary}};
+        }catch(e){diag({stage:'debugImageRenderError',type,name,error:e?.message||String(e)})}
+      }
+      return base;
+    }
     if(!base.pdfDoc)return {...base,ocrUsed:false,ocrError:'PDFの文字レイヤーが取得できませんでした'};
     const attempts=[];
     try{
@@ -941,8 +962,9 @@ const FurusatoGoogleDrive = (() => {
       // extractor instead of silently losing that insurance item.
       socialComponents[k]=extractExactYenAfterLabel(text,labels) ?? extractLabeledNumber(text,labels);
     }
-    const socialValues=Object.values(socialComponents);
-    const socialTotal=socialValues.every(v=>Number.isFinite(v))?socialValues.reduce((a,v)=>a+v,0):null;
+    const requiredSocialKeys=['employmentInsurance','healthInsurance','healthInsuranceSpecial','nursingCare','pension'];
+    const requiredSocialOk=requiredSocialKeys.every(k=>Number.isFinite(socialComponents[k]));
+    const socialTotal=requiredSocialOk?requiredSocialKeys.reduce((a,k)=>a+socialComponents[k],0)+(Number.isFinite(socialComponents.childSupport)?socialComponents.childSupport:0):null;
     const grossComponents=[];
     const base=extractExactYenAfterLabel(text,['基準賃金等']);
     const commuting=extractExactYenAfterLabel(text,['通勤費補助']);
@@ -1008,7 +1030,7 @@ const FurusatoGoogleDrive = (() => {
       if(!c.components?.length&&o.grossComponents?.length)c={...c,grossComponents:o.grossComponents};
       if(c.taxableGross!=null&&c.nonTaxableTotal!=null&&c.grossTotal==null)c.grossTotal=c.taxableGross+c.nonTaxableTotal;
       const derived=(c.grossTotal!=null&&c.nonTaxableTotal!=null)?c.grossTotal-c.nonTaxableTotal:null;
-      const socialOk=Object.values(c.socialComponents||{}).length===6&&Object.values(c.socialComponents||{}).every(v=>Number.isFinite(v));
+      const sc=c.socialComponents||{};const socialOk=REQUIRED_SOCIAL_COMPONENTS.every(k=>Number.isFinite(sc[k]))&&(sc.childSupport==null||Number.isFinite(sc.childSupport));
       c={...c,unknownComponents:[...(c.grossTotal==null?['支給合計']:[]),...(c.nonTaxableTotal==null?['非課税分']:[]),...(c.taxableGross==null?['課税対象額']:[]),...(c.socialTotal==null?['社会保険料']:[])],arithmeticOk:derived!=null&&c.taxableGross===derived&&socialOk,coreOk:Number(c.taxableGross)>0,needsReview:!(Number(c.taxableGross)>0)};
     }
     const taxableGross=Number.isFinite(c.taxableGross)&&c.taxableGross>0?c.taxableGross:null;
@@ -1117,7 +1139,7 @@ const FurusatoGoogleDrive = (() => {
       const tri=(net!=null?tris.find(x=>x.net===net):null)||tris.sort((x,y)=>y.deduction-x.deduction)[0];
       if(tri){amount=amount??tri.amount;deduction=deduction??tri.deduction;if(net==null||net===amount||net!==tri.net)net=tri.net;}
     }
-    const socialValues=Object.values(socialComponents); const socialKnown=socialValues.filter(v=>Number.isFinite(v)); const social=socialKnown.length?socialKnown.reduce((a,v)=>a+v,0):null;
+    const requiredSocialKeys=['employmentInsurance','healthInsurance','healthInsuranceSpecial','nursingCare','pension']; const requiredSocialOk=requiredSocialKeys.every(k=>Number.isFinite(socialComponents[k])); const social=requiredSocialOk?requiredSocialKeys.reduce((a,k)=>a+socialComponents[k],0)+(Number.isFinite(socialComponents.childSupport)?socialComponents.childSupport:0):null;
     const standardHealth=extractThousandAfterLabel(text,['健康保険/介護保険','健康保険／介護保険']);
     const standardPension=extractThousandAfterLabel(text,['厚生年金保険（150万/回）','厚生年金保険 (150万/回)','厚生年金保険（150万／回）']);
     const derivedNet=(amount!=null&&deduction!=null)?amount-deduction:null;
