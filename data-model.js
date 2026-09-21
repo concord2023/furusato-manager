@@ -46,7 +46,8 @@ const FurusatoModel = (() => {
       s.forecastBonus=0;
       s.bonusSocialRecords=clone(DEFAULT.bonusSocialRecords);
     }
-    s.schemaVersion=10;
+    if(Number(raw?.schemaVersion||0)<11){s.deductions=s.deductions||{};s.deductions.incomeAdjustmentOverride=null;s.deductions.specialDependentOverride=null;}
+    s.schemaVersion=11;
     s.importSettings=s.importSettings||{targetYear:s.year||2026,priorYear:(s.year||2026)-1};
     s.importSettings.targetYear=Number(s.importSettings.targetYear)||Number(s.year)||2026;
     s.importSettings.priorYear=s.importSettings.targetYear-1;
@@ -58,6 +59,17 @@ const FurusatoModel = (() => {
     // Never let a legacy auto row masquerade as a newly imported actual month.
     s.salaryRecords=s.salaryRecords.filter(r=>!(r.source==='auto' && !r.document && !r.driveFileId && !r.fileId));
     s.socialRecords=(s.socialRecords||[]).filter(r=>!(r.source==='auto' && !r.document && !r.driveFileId && !r.fileId));
+    // Salary records are the authoritative monthly source. If an older build
+    // saved the social-insurance amount only inside the salary row, restore it
+    // here so January-April cannot disappear merely because socialRecords was
+    // written by a different parser version.
+    for(const r of s.salaryRecords){
+      if(r.status!=='actual' || !(Number(r.social)>0 || r.socialComponents)) continue;
+      const has=(s.socialRecords||[]).some(x=>Number(x.year||s.year)===Number(r.year||s.year)&&Number(x.month)===Number(r.month));
+      if(!has && Number(r.social)>0){
+        s.socialRecords.push({year:r.year||s.year,month:r.month,amount:Number(r.social),components:r.socialComponents||{},source:r.source||'recovered',status:'actual',document:r.document||'',driveFileId:r.driveFileId||'',needsReview:false});
+      }
+    }
     // Recompute the actual-through marker from actual salary records instead of trusting
     // stale metadata such as the old fixed "through September" default.
     const actualMonths=s.salaryRecords.filter(r=>r.status==='actual' && Number(r.month)>=1 && Number(r.month)<=12 && Number(r.taxableGross)>0).map(r=>Number(r.month));
@@ -86,6 +98,14 @@ const FurusatoModel = (() => {
     s.family.spouse=s.family.spouse&&typeof s.family.spouse==='object'?s.family.spouse:{exists:false,name:'',income:0,age:null,source:'manual',needsConfirmation:false};
     s.family.dependents=Array.isArray(s.family.dependents)?s.family.dependents:[];
     s.priorWithholding=s.priorWithholding||null; s.currentWithholding=s.currentWithholding||null;
+    if(!s.priorWithholding){
+      const candidates=[...(s.withholdingRecords||[]),...(s.sourceDocuments||[])].filter(x=>Number(x.year)===Number(s.importSettings?.priorYear||((s.year||new Date().getFullYear())-1)) && Number(x.annualSalary)>0);
+      if(candidates.length)s.priorWithholding=clone(candidates.sort((a,b)=>String(b.document||b.file||'').localeCompare(String(a.document||a.file||'')))[0]);
+    }
+    if(!s.currentWithholding){
+      const candidates=(s.withholdingRecords||[]).filter(x=>Number(x.year)===Number(s.year)&&Number(x.annualSalary)>0);
+      if(candidates.length)s.currentWithholding=clone(candidates[0]);
+    }
     s.bonusSocialRecords=Array.isArray(s.bonusSocialRecords)?s.bonusSocialRecords:[];
     if(!s.salaryRecords?.length && Array.isArray(raw?.salary)){
       // Legacy arrays had no reliable distinction between actual and forecast.

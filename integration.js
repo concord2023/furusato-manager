@@ -110,7 +110,8 @@ const FurusatoGoogleDrive = (() => {
       const name=String(f.name||'');
       const isPdf=/\.pdf$/i.test(name)||f.mimeType==='application/pdf';
       if(!isPdf)continue;
-      const y=yearFromName(name);
+      let y=yearFromName(name);
+      if(y===null && candidateTypeFromName(name)==='withholding'){ const m=String(name).match(/(20\d{2})(0[1-9]|1[0-2])/); if(m)y=Number(m[1]); }
       if(y===null || !years.includes(y))continue;
       const type=candidateTypeFromName(name);
       if(type==='unknown')continue;
@@ -124,7 +125,7 @@ const FurusatoGoogleDrive = (() => {
   // This is deliberately separate from furusatoState: payroll state is the calculation
   // snapshot, while this store is the source-document cache.
   const IMPORT_CACHE_DB='furusatoSourceCache';
-  const IMPORT_CACHE_VERSION='20260921-forecast-cache-2';
+  const IMPORT_CACHE_VERSION='20260921-source-audit-1';
   function cacheSignature(f){return `${f.id||f.name}|${f.modifiedTime||''}|${f.size||''}`}
   function openImportCache(){return new Promise((resolve,reject)=>{
     if(!('indexedDB' in window))return resolve(null);
@@ -134,11 +135,12 @@ const FurusatoGoogleDrive = (() => {
   })}
   async function getCachedParsed(f){
     const db=await openImportCache(); if(!db)return null;
-    return new Promise(resolve=>{try{const tx=db.transaction('files','readonly'),st=tx.objectStore('files'),q=st.get(String(f.id||f.name));q.onsuccess=()=>{const v=q.result;resolve(v&&v.version===IMPORT_CACHE_VERSION&&v.signature===cacheSignature(f)?v:null)};q.onerror=()=>resolve(null)}catch{resolve(null)}});
+    return new Promise(resolve=>{try{const tx=db.transaction('files','readonly'),st=tx.objectStore('files'),q=st.get(String(f.id||f.name));q.onsuccess=()=>{const v=q.result; if(!v||v.version!==IMPORT_CACHE_VERSION||v.signature!==cacheSignature(f)){resolve(null);return;} const x=v.x||{}; const type=v.type||f.candidateType||'unknown'; const complete= type==='withholding' ? !!(x.year&&Number(x.annualSalary)>0&&Number(x.incomeTax)>=0&&Number(x.social)>=0&&!x.needsReview) : type==='salary_slip' ? !!(x.year&&x.month&&Number(x.taxableGross)>0&&Number(x.social)>=0&&!x.needsReview) : type==='bonus_slip' ? !!(x.year&&x.date&&Number(x.amount)>0&&Number(x.social)>=0&&!x.needsReview) : true; resolve(complete?v:null)};q.onerror=()=>resolve(null)}catch{resolve(null)}});
   }
+  function cacheSafePdf(pdf){ if(!pdf||typeof pdf!=='object')return pdf; const {pdfDoc,...rest}=pdf; return rest; }
   async function putCachedParsed(f,pdf,x,type){
     const db=await openImportCache(); if(!db)return;
-    await new Promise(resolve=>{try{const tx=db.transaction('files','readwrite');tx.objectStore('files').put({id:String(f.id||f.name),version:IMPORT_CACHE_VERSION,signature:cacheSignature(f),name:f.name,type:f.candidateType||type,storedAt:new Date().toISOString(),pdf,x});tx.oncomplete=()=>resolve();tx.onerror=()=>resolve();tx.onabort=()=>resolve()}catch{resolve()}});
+    await new Promise(resolve=>{try{const tx=db.transaction('files','readwrite');tx.objectStore('files').put({id:String(f.id||f.name),version:IMPORT_CACHE_VERSION,signature:cacheSignature(f),name:f.name,type:f.candidateType||type,storedAt:new Date().toISOString(),pdf:cacheSafePdf(pdf),x});tx.oncomplete=()=>resolve();tx.onerror=()=>resolve();tx.onabort=()=>resolve()}catch{resolve()}});
   }
   async function cachedOrParsed(f){
     const cached=await getCachedParsed(f); if(cached)return {pdf:cached.pdf,x:cached.x,type:cached.type,cacheHit:true};
@@ -966,7 +968,9 @@ const FurusatoGoogleDrive = (() => {
     return null;
   }
   function parseWithholdingPdf(text,name){
-    const raw=typeof text==='string'?text:(text?.text||'');
+    const rawBase=typeof text==='string'?text:(text?.text||'');
+    const rawOcr=text&&typeof text==='object'&&text.ocrText?String(text.ocrText):'';
+    const raw=[rawBase,rawOcr].filter(Boolean).join('\n');
     const reiwa=String(raw).match(/令\s*和\s*(\d{1,2})\s*年\s*分/);
     const fd=filenameDateFallback(name); const d=extractDateParts(raw,name);
     const year=reiwa?2018+Number(reiwa[1]):(fd.year??d.year);
@@ -1011,40 +1015,47 @@ const FurusatoGoogleDrive = (() => {
     if(detailIdx>=0){for(let i=detailIdx+1;i<=Math.min(lines.length-1,detailIdx+45);i++)detailVals.push(...extractNumericTokens(lines[i]).map(x=>x.n).filter(n=>n>=10000&&n<1000000));}
     const lifeDetailIdx=raw.lastIndexOf('生命保険料の');
     const lifeDetailNums=lifeDetailIdx>=0?extractNumericTokens(raw.slice(lifeDetailIdx,lifeDetailIdx+900)).map(v=>v.n).filter(v=>!(v>=1900&&v<=2100)):[];
-    const newLifeInsurance=pick('新生命保険料の金額')??lifeDetailNums[0]??detailVals[0];
-    const oldLifeInsurance=pick('旧生命保険料の金額')??lifeDetailNums[1]??detailVals[1];
-    const nursingInsurance=pick('介護医療保険料の金額')??lifeDetailNums[2]??detailVals[2];
-    const newPension=pick('新個人年金保険料の金額')??lifeDetailNums[3]??null;
-    const oldPension=pick('旧個人年金保険料の金額')??lifeDetailNums[4]??null;
+    const newLifeInsurance=pick('新生命保険料の金額',['新生命保険料の金'])??lifeDetailNums[0]??detailVals[0];
+    const oldLifeInsurance=pick('旧生命保険料の金額',['旧生命保険料の金'])??lifeDetailNums[1]??detailVals[1];
+    const nursingInsurance=pick('介護医療保険料の金額',['介護医療保険料の金'])??lifeDetailNums[2]??detailVals[2];
+    const newPension=pick('新個人年金保険料の金額',['新個人年金保険料の金'])??null;
+    const oldPension=pick('旧個人年金保険料の金額',['旧個人年金保険料の金'])??lifeDetailNums[3]??null;
     // 氏名は控除計算に不要なので取得・入力対象にしない。
     // 源泉徴収票からは、控除対象配偶者の存在と扶養親族の年齢だけを前年参考として読む。
     const familyAnchor=Math.max(raw.indexOf('(源泉・特別)'),raw.indexOf('源泉・特別'));
     const familyTail=familyAnchor>=0?raw.slice(familyAnchor):'';
-    const spousePresent=/控除対象\s*配偶者[\s\S]{0,180}?氏名/.test(familyTail);
-    const dependentAges=[];
-    for(const m of familyTail.matchAll(/区\s*分\s*(\d+)/g)){const age=Number(m[1]);if(age>4&&age<=120)dependentAges.push(age+1);}
-    const dependentAgeList=[...new Set(dependentAges)];
-    if(text&&typeof text==='object'&&text.ocrWords?.length){
+    const spousePresent=/(?:^|\n)\s*有\s+従有\b/.test(raw)||/控除対象\s*配偶者[\s\S]{0,260}(?:有|従有)/.test(raw);
+    // 源泉徴収票の「扶養親族等の数」は人数区分であり、年齢そのものではない。
+    // 年齢を推測して扶養控除を自動適用すると誤計算になるため、年齢は空欄のまま保持し、
+    // 読み取れた人数・特定親族特別控除額などを証拠情報として保存する。
+    const dependentAgeList=[];
+    const compactFamily=raw.replace(/\s+/g,'');
+    const di=compactFamily.indexOf('控除対象扶養親族等の数');
+    const dependentCountEvidence=di>=0?compactFamily.slice(di,di+220):'';
+    const si=compactFamily.indexOf('16歳未満扶養親族の数');
+    const sixteenCountEvidence=si>=0?compactFamily.slice(si,si+100):'';
+    if(text&&typeof text==='object'&&(text.ocrWords?.length||text.ocrText)){
+      const ocrParsed=text.ocrText?parseWithholdingPdf(String(text.ocrText),name):{};
       const f=ocrPayrollFallback(text,'withholding')||{};
-      annualSalary=f.annualSalary??annualSalary;
-      salaryIncomeAfterDeduction=f.salaryIncomeAfterDeduction??salaryIncomeAfterDeduction;
-      deductionsTotal=f.deductionsTotal??deductionsTotal;
-      incomeTax=f.incomeTax??incomeTax;
-      social=f.social??social;
-      lifeInsuranceDeduction=f.lifeInsuranceDeduction??lifeInsuranceDeduction;
-      specialDependent=f.specialDependent??specialDependent;
-      basicDeduction=f.basicDeduction??basicDeduction;
+      annualSalary=f.annualSalary??ocrParsed.annualSalary??annualSalary;
+      salaryIncomeAfterDeduction=f.salaryIncomeAfterDeduction??ocrParsed.salaryIncomeAfterDeduction??salaryIncomeAfterDeduction;
+      deductionsTotal=f.deductionsTotal??ocrParsed.deductionsTotal??deductionsTotal;
+      incomeTax=f.incomeTax??ocrParsed.incomeTax??incomeTax;
+      social=f.social??ocrParsed.social??social;
+      lifeInsuranceDeduction=f.lifeInsuranceDeduction??ocrParsed.lifeInsuranceDeduction??lifeInsuranceDeduction;
+      specialDependent=f.specialDependent??ocrParsed.specialDependent??specialDependent;
+      basicDeduction=f.basicDeduction??ocrParsed.basicDeduction??basicDeduction;
       // OCR can read the 580,000 field as just "580" when the trailing
       // zeros are visually merged with the neighboring cell. In a yen-valued
       // basic-deduction field, a three-digit OCR result is incomplete.
       if(Number.isFinite(basicDeduction)&&basicDeduction>=100&&basicDeduction<1000)basicDeduction*=1000;
-      incomeAdjustment=f.incomeAdjustment??incomeAdjustment;
+      incomeAdjustment=f.incomeAdjustment??ocrParsed.incomeAdjustment??incomeAdjustment;
     }
     const required=[annualSalary,salaryIncomeAfterDeduction,deductionsTotal,incomeTax,social];
     const fieldsPresent=required.every(Number.isFinite);
     const relationsOk=fieldsPresent&&annualSalary>salaryIncomeAfterDeduction&&salaryIncomeAfterDeduction>0&&deductionsTotal>=social&&incomeTax>=0&&incomeTax<=annualSalary;
     const arithmeticOk=fieldsPresent&&relationsOk;
-    return {year,annualSalary,salaryIncomeAfterDeduction,deductionsTotal,social,incomeTax,lifeInsuranceDeduction,earthquakeInsuranceDeduction,oldLongTermDamageInsurance,housingLoanDeduction,specialDependent,basicDeduction,incomeAdjustment,newLifeInsurance,oldLifeInsurance,nursingInsurance,newPension,oldPension,spousePresent,dependentAgeList,document:name,source:'google-drive',status:'actual',arithmeticOk,needsReview:!arithmeticOk};
+    return {year,annualSalary,salaryIncomeAfterDeduction,deductionsTotal,social,incomeTax,lifeInsuranceDeduction,earthquakeInsuranceDeduction,oldLongTermDamageInsurance,housingLoanDeduction,specialDependent,basicDeduction,incomeAdjustment,newLifeInsurance,oldLifeInsurance,nursingInsurance,newPension,oldPension,spousePresent,dependentAgeList,dependentCountEvidence,sixteenCountEvidence,document:name,source:'google-drive',status:'actual',arithmeticOk,needsReview:!arithmeticOk};
   }
   function uniquePush(arr,item,key){const k=key(item);if(!arr.some(x=>key(x)===k))arr.push(item);}
   function recordHistory(state,item){
@@ -1160,7 +1171,7 @@ const FurusatoGoogleDrive = (() => {
           if(!upsertBonusRecord(state,x,f,targetYear,result) && Number(x.year)===Number(priorYear) && x.date&&x.amount&&x.season){state.priorBonusRecords=state.priorBonusRecords||[];const season=x.season||bonusSeason(x.month);state.priorBonusRecords=state.priorBonusRecords.filter(v=>!(Number(v.year)===Number(priorYear)&&(v.season||bonusSeason(v.month))===season));state.priorBonusRecords.push({year:priorYear,date:x.date,month:x.month,season,amount:x.amount,social:x.social,socialComponents:x.socialComponents||{},standardBonusHealth:x.standardBonusHealth,standardBonusPension:x.standardBonusPension,source:'prior',status:'prior',document:f.name,driveFileId:f.id});result.added++;recordHistory(state,{at:new Date().toISOString(),name:f.name,type:'bonus',year:x.year||f.filenameYear||null,month:x.month||null,date:x.date||null,status:'取り込み済み',amount:x.amount||null,social:x.social||null,needsReview:false});}else if(!(x.date&&x.amount&&x.season)){result.review++;state.importHistory.unshift({at:new Date().toISOString(),name:f.name,type:'bonus',year:x.year||f.filenameYear||null,status:'確認待ち',amount:x.amount||null,social:x.social||null,needsReview:true,reason:x.date&&x.amount&&!x.season?'賞与月が夏（5〜9月）/冬（10〜2月）のどちらにも判定できませんでした':'賞与額または年月を取得できませんでした'});}
         }else if(type==='withholding'){
           Object.assign(detail,{year:x.year||null,annualSalary:x.annualSalary||0,salaryIncomeAfterDeduction:x.salaryIncomeAfterDeduction||0,deductionsTotal:x.deductionsTotal||0,social:x.social||0,incomeTax:x.incomeTax||0,lifeInsuranceDeduction:x.lifeInsuranceDeduction||0,earthquakeInsuranceDeduction:x.earthquakeInsuranceDeduction||0,oldLongTermDamageInsurance:x.oldLongTermDamageInsurance||0,housingLoanDeduction:x.housingLoanDeduction||0,specialDependent:x.specialDependent||0,basicDeduction:x.basicDeduction||0,incomeAdjustment:x.incomeAdjustment||0,newLifeInsurance:x.newLifeInsurance||0,oldLifeInsurance:x.oldLifeInsurance||0,nursingInsurance:x.nursingInsurance||0,newPension:x.newPension||0,oldPension:x.oldPension||0,spousePresent:!!x.spousePresent,dependentAgeList:x.dependentAgeList||[],needsReview:!!x.needsReview}); if(x.year&&![targetYear,priorYear].includes(Number(x.year))){result.skipped++;continue}
-          state.sourceDocuments=state.sourceDocuments||[];const old=state.sourceDocuments.find(d=>d.file===f.name);const doc={file:f.name,type,status:'imported',source:'google-drive',driveFileId:f.id,note:`源泉徴収票を取得。${x.year===priorYear?'前年参考値として保持':'対象年の参考資料として保持'}。`,annualSalary:x.annualSalary||0,social:x.social||0,incomeTax:x.incomeTax||0,year:x.year||null};if(old)Object.assign(old,doc);else state.sourceDocuments.push(doc);
+          state.sourceDocuments=state.sourceDocuments||[];const old=state.sourceDocuments.find(d=>d.file===f.name);const doc={file:f.name,type,status:x.needsReview?'review_needed':'imported',source:'google-drive',driveFileId:f.id,note:`源泉徴収票を取得。${x.year===priorYear?'前年参考値として保持':'対象年の参考資料として保持'}。`,year:x.year||null,annualSalary:x.annualSalary||0,salaryIncomeAfterDeduction:x.salaryIncomeAfterDeduction||0,deductionsTotal:x.deductionsTotal||0,social:x.social||0,incomeTax:x.incomeTax||0,lifeInsuranceDeduction:x.lifeInsuranceDeduction||0,earthquakeInsuranceDeduction:x.earthquakeInsuranceDeduction||0,oldLongTermDamageInsurance:x.oldLongTermDamageInsurance||0,housingLoanDeduction:x.housingLoanDeduction||0,specialDependent:x.specialDependent||0,basicDeduction:x.basicDeduction||0,incomeAdjustment:x.incomeAdjustment||0,newLifeInsurance:x.newLifeInsurance||0,oldLifeInsurance:x.oldLifeInsurance||0,nursingInsurance:x.nursingInsurance||0,newPension:x.newPension||0,oldPension:x.oldPension||0,spousePresent:!!x.spousePresent,dependentAgeList:x.dependentAgeList||[],arithmeticOk:!!x.arithmeticOk,needsReview:!!x.needsReview};if(old)Object.assign(old,doc);else state.sourceDocuments.push(doc);
           state.withholdingRecords=Array.isArray(state.withholdingRecords)?state.withholdingRecords:[];
           const wr={...x,source:'google-drive',status:'actual',document:f.name,driveFileId:f.id};
           const wi=state.withholdingRecords.findIndex(r=>r.document===f.name||r.driveFileId===f.id); if(wi>=0)state.withholdingRecords[wi]={...state.withholdingRecords[wi],...wr}; else state.withholdingRecords.push(wr);
@@ -1176,18 +1187,20 @@ const FurusatoGoogleDrive = (() => {
             state.family=state.family||{};
             if(x.spousePresent)state.family.spouse={...(state.family.spouse||{}),exists:true,source:'prior-withholding',needsConfirmation:true};
             if(Array.isArray(x.dependentAgeList)&&x.dependentAgeList.length)state.family.dependents=x.dependentAgeList.map(age=>({age,income:0,relationship:'扶養親族',livingTogether:false,disability:'',source:'prior-withholding',needsConfirmation:true}));
-            state.deductions.incomeAdjustmentOverride=Number(x.incomeAdjustment)||0; state.deductions.specialDependentOverride=Number(x.specialDependent)||0; state.family.priorNote=String(priorYear)+'年源泉徴収票から自動読取。現在年の年齢・所得・扶養状況は要確認';
+            state.priorTaxAdjustments={incomeAdjustment:Number(x.incomeAdjustment)||0,specialDependent:Number(x.specialDependent)||0,basicDeduction:Number(x.basicDeduction)||0,year:priorYear}; state.family.priorNote=String(priorYear)+'年源泉徴収票から自動読取。現在年の年齢・所得・扶養状況は要確認';
           } else if(x.year===targetYear){
             state.currentWithholding={...wr,source:'current-withholding'};
           }
-          result.review++;
+          if(x.needsReview) result.review++;
+          else result.added++;
         }else {result.skipped++;state.importHistory.unshift({at:new Date().toISOString(),name:f.name,type:type||f.candidateType||'other',year:f.filenameYear||null,status:'対象外'});}
       }catch(e){result.errors.push(`${f.name}: ${e.message}`);recordHistory(state,{at:new Date().toISOString(),name:f.name,type:f.candidateType||'other',year:f.filenameYear||null,status:'エラー',reason:e.message});}
     }
     rebuildPriorSummary(state,priorYear); const actualThrough=deriveActualThrough(state,targetYear); buildForecastFromPrior(state,targetYear,actualThrough); state.importDiagnostics={at:new Date().toISOString(),targetYear,actualThrough,files:result.files,discoveredFiles:result.discoveredFiles,cacheHits:result.cacheHits,cacheMisses:result.cacheMisses,downloads:result.downloads,parsed:result.parsed,salaryCandidates:result.salaryCandidates,salaryImported:result.salaryImported,salaryParsed:result.salaryParsed,salaryOcr:result.salaryOcr,salaryRejected:result.salaryRejected,errors:result.errors.slice(),fileDetails:state.importFileDetails||[],runtimeReadout:runtimeDiagnostics.slice()}; state.importHistory=state.importHistory.filter(x=>{const y=Number(x?.year||0);return !y||y===targetYear||y===priorYear}).slice(0,200); state.importSettings={...(state.importSettings||{}),targetYear,priorYear};
     return result;
   }
-  return {CLIENT_KEY,getClientId,setClientId,ready,authorize,signOut,listCandidateFiles,scanAndImport,classifyPdfText,parseSalaryPdf,parseBonusPdf,parseWithholdingPdf,extractLabeledNumber,extractToyotaPayrollAmount,extractExactYenAfterLabel,upsertSalaryRecord,upsertBonusRecord,ensurePdfText,getRuntimeDiagnostics,clearRuntimeDiagnostics,getLastOcrImageDataUrl:()=>lastOcrImageDataUrl};
+  async function getCachedSourceEntries(){const db=await openImportCache();if(!db)return[];return new Promise(resolve=>{try{const tx=db.transaction('files','readonly'),st=tx.objectStore('files'),q=st.getAll();q.onsuccess=()=>resolve(q.result||[]);q.onerror=()=>resolve([])}catch{resolve([])}})}
+  return {CLIENT_KEY,getClientId,setClientId,ready,authorize,signOut,listCandidateFiles,scanAndImport,classifyPdfText,parseSalaryPdf,parseBonusPdf,parseWithholdingPdf,extractLabeledNumber,extractToyotaPayrollAmount,extractExactYenAfterLabel,upsertSalaryRecord,upsertBonusRecord,ensurePdfText,getRuntimeDiagnostics,clearRuntimeDiagnostics,getLastOcrImageDataUrl:()=>lastOcrImageDataUrl,getCachedSourceEntries};
 })();
 if(typeof window!=='undefined')window.FurusatoGoogleDrive=FurusatoGoogleDrive;
 if(typeof module!=='undefined')module.exports={FurusatoImport,FurusatoGoogleDrive};
