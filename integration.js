@@ -144,8 +144,8 @@ const FurusatoGoogleDrive = (() => {
   // This is deliberately separate from furusatoState: payroll state is the calculation
   // snapshot, while this store is the source-document cache.
   const IMPORT_CACHE_DB='furusatoSourceCache';
-  const IMPORT_CACHE_VERSION='20260921-source-audit-7';
-  const IMPORT_CACHE_DB_VERSION=2;
+  const IMPORT_CACHE_VERSION='20260921-source-audit-8';
+  const IMPORT_CACHE_DB_VERSION=3;
   function cacheSignature(f){return `${f.id||f.name}|${f.modifiedTime||''}|${f.size||''}`}
   function openImportCache(){return new Promise((resolve,reject)=>{
     if(!('indexedDB' in window))return resolve(null);
@@ -195,20 +195,36 @@ const FurusatoGoogleDrive = (() => {
     return out;
   }
   function cacheSafePdf(pdf){ return stripCachePayload(pdf); }
+  function dataUrlToBlob(dataUrl){
+    const m=String(dataUrl||'').match(/^data:([^;,]+)?(;base64)?,(.*)$/s); if(!m)return null;
+    const mime=m[1]||'image/png';
+    try{
+      if(m[2]){const bin=atob(m[3]);const bytes=new Uint8Array(bin.length);for(let i=0;i<bin.length;i++)bytes[i]=bin.charCodeAt(i);return new Blob([bytes],{type:mime});}
+      return new Blob([decodeURIComponent(m[3])],{type:mime});
+    }catch{return null}
+  }
+  function blobToDataUrl(blob){return new Promise(resolve=>{if(!blob)return resolve('');try{const r=new FileReader();r.onload=()=>resolve(String(r.result||''));r.onerror=()=>resolve('');r.readAsDataURL(blob)}catch{resolve('')}})}
   async function saveDebugImageRecord(f,region,dataUrl){
-    if(!dataUrl)return; const db=await openImportCache(); if(!db)return;
-    await new Promise(resolve=>{try{const tx=db.transaction('debugImages','readwrite');tx.objectStore('debugImages').put({id:`${String(f.id||f.name)}|${region}`,name:f.name,fileId:String(f.id||''),region,dataUrl,signature:cacheSignature(f),storedAt:new Date().toISOString()});tx.oncomplete=()=>resolve();tx.onerror=()=>resolve();tx.onabort=()=>resolve()}catch{resolve()}});
+    if(!dataUrl)return false; const db=await openImportCache(); if(!db)return false;
+    const blob=dataUrlToBlob(dataUrl); if(!blob)return false;
+    const id=`${String(f.id||f.name)}|${region}`;
+    const record={id,name:f.name,fileId:String(f.id||''),region,blob,dataUrl:String(dataUrl),mime:blob.type||'image/png',bytes:blob.size,signature:cacheSignature(f),storedAt:new Date().toISOString()};
+    const ok=await new Promise(resolve=>{try{const tx=db.transaction('debugImages','readwrite');tx.objectStore('debugImages').put(record);tx.oncomplete=()=>resolve(true);tx.onerror=()=>resolve(false);tx.onabort=()=>resolve(false)}catch{resolve(false)}});
+    if(!ok)return false;
     // Keep a small rolling set so iPhone storage does not grow indefinitely.
-    try{const all=await new Promise(resolve=>{const tx=db.transaction('debugImages','readonly'),st=tx.objectStore('debugImages'),q=st.getAll();q.onsuccess=()=>resolve(q.result||[]);q.onerror=()=>resolve([])});if(all.length>12){all.sort((a,b)=>String(a.storedAt).localeCompare(String(b.storedAt)));const tx=db.transaction('debugImages','readwrite'),st=tx.objectStore('debugImages');for(const x of all.slice(0,all.length-12))st.delete(x.id)}}catch{}
+    try{const all=await new Promise(resolve=>{const tx=db.transaction('debugImages','readonly'),st=tx.objectStore('debugImages'),q=st.getAll();q.onsuccess=()=>resolve(q.result||[]);q.onerror=()=>resolve([])});if(all.length>12){all.sort((a,b)=>String(a.storedAt).localeCompare(String(b.storedAt)));await new Promise(resolve=>{const tx=db.transaction('debugImages','readwrite'),st=tx.objectStore('debugImages');for(const x of all.slice(0,all.length-12))st.delete(x.id);tx.oncomplete=()=>resolve();tx.onerror=()=>resolve();tx.onabort=()=>resolve()})}}catch{}
+    return true;
   }
   async function saveDebugImages(f,pdf){
-    const imgs=pdf?.ocrDebugImages||{};
-    if(imgs.full)await saveDebugImageRecord(f,'full',imgs.full);
-    if(imgs.salarySocial)await saveDebugImageRecord(f,'salarySocial',imgs.salarySocial);
-    if(imgs.salarySummary)await saveDebugImageRecord(f,'salarySummary',imgs.salarySummary);
+    const imgs=pdf?.ocrDebugImages||{}; let saved=0;
+    if(imgs.full&&await saveDebugImageRecord(f,'full',imgs.full))saved++;
+    if(imgs.salarySocial&&await saveDebugImageRecord(f,'salarySocial',imgs.salarySocial))saved++;
+    if(imgs.salarySummary&&await saveDebugImageRecord(f,'salarySummary',imgs.salarySummary))saved++;
+    return saved;
   }
-  async function getDebugImages(){const db=await openImportCache();if(!db)return[];return new Promise(resolve=>{try{const tx=db.transaction('debugImages','readonly'),st=tx.objectStore('debugImages'),q=st.getAll();q.onsuccess=()=>resolve((q.result||[]).sort((a,b)=>String(b.storedAt).localeCompare(String(a.storedAt))));q.onerror=()=>resolve([])}catch{resolve([])}})}
+  async function getDebugImages(){const db=await openImportCache();if(!db)return[];return new Promise(resolve=>{try{const tx=db.transaction('debugImages','readonly'),st=tx.objectStore('debugImages'),q=st.getAll();q.onsuccess=async()=>{const rows=(q.result||[]).sort((a,b)=>String(b.storedAt).localeCompare(String(a.storedAt)));for(const r of rows){if(!r.dataUrl)r.dataUrl=await blobToDataUrl(r.blob)}resolve(rows)};q.onerror=()=>resolve([])}catch{resolve([])}})}
   async function getLatestDebugImage(preferRegion='salarySocial'){const all=await getDebugImages();return all.find(x=>x.region===preferRegion)?.dataUrl||all[0]?.dataUrl||null}
+  async function getDebugImageMeta(){const all=await getDebugImages();return all.map(x=>({id:x.id,name:x.name,region:x.region,bytes:Number(x.bytes||0),storedAt:x.storedAt,signature:x.signature}))}
   async function putCachedParsed(f,pdf,x,type){
     const db=await openImportCache(); if(!db)return;
     await new Promise(resolve=>{try{const tx=db.transaction('files','readwrite');tx.objectStore('files').put({id:String(f.id||f.name),version:IMPORT_CACHE_VERSION,signature:cacheSignature(f),name:f.name,type:canonicalCachedType(f,type),storedAt:new Date().toISOString(),pdf:cacheSafePdf(pdf),x});tx.oncomplete=()=>resolve();tx.onerror=()=>resolve();tx.onabort=()=>resolve()}catch{resolve()}});
@@ -222,7 +238,7 @@ const FurusatoGoogleDrive = (() => {
     if(type==='salary_slip')x=parseSalaryPdf(pdf,f.name);
     else if(type==='bonus_slip')x=parseBonusPdf(pdf,f.name);
     else if(type==='withholding')x=parseWithholdingPdf(pdf,f.name);
-    await saveDebugImages(f,pdf);
+    pdf.debugImagesSaved=await saveDebugImages(f,pdf);
     await putCachedParsed(f,pdf,x,type);
     return {pdf,x,type,cacheHit:false};
   }
@@ -390,9 +406,11 @@ const FurusatoGoogleDrive = (() => {
     // intentionally allowed to run for parsing, but must never replace the
     // preview with a cropped rectangle.
     if(!region) lastOcrImageDataUrl=imageDataUrl;
-    const rOcr=await window.Tesseract.recognize(imageDataUrl,lang,{tessedit_pageseg_mode:psm,preserve_interword_spaces:'1'});
+    let rOcr=null;
+    try{rOcr=await window.Tesseract.recognize(imageDataUrl,lang,{tessedit_pageseg_mode:psm,preserve_interword_spaces:'1'});}
+    catch(e){return {text:'',words:[],pages:[],pageCount:doc.numPages,textItemCount:0,ocrUsed:true,ocrConfidence:0,ocrPsm:psm,ocrLang:lang,ocrWidth:cw,ocrHeight:ch,ocrRegion:!!region,imageBytes:imageDataUrl.length,imageDataUrl,ocrError:e?.message||String(e),cornerNonWhite:nonWhite,cornerMean:sample.length?sum/(sample.length/4):255,renderSampleWidth:statW,renderSampleHeight:statH,renderNonWhite:fullNonWhite,renderNonWhiteRatio:fullPixels?fullNonWhite/fullPixels:0,renderMean:fullPixels?fullSum/fullPixels:255,renderMin:fullMin,renderMax:fullMax};}
     const data=rOcr?.data||{};
-    const result={text:String(data.text||''),words:Array.isArray(data.words)?data.words:[],pages:[],pageCount:doc.numPages,textItemCount:0,ocrUsed:true,ocrConfidence:Number(data.confidence||0),ocrPsm:psm,ocrLang:lang,ocrWidth:cw,ocrHeight:ch,ocrRegion:!!region,imageBytes:imageDataUrl.length,cornerNonWhite:nonWhite,cornerMean:sample.length?sum/(sample.length/4):255,renderSampleWidth:statW,renderSampleHeight:statH,renderNonWhite:fullNonWhite,renderNonWhiteRatio:fullPixels?fullNonWhite/fullPixels:0,renderMean:fullPixels?fullSum/fullPixels:255,renderMin:fullMin,renderMax:fullMax};
+    const result={text:String(data.text||''),words:Array.isArray(data.words)?data.words:[],pages:[],pageCount:doc.numPages,textItemCount:0,ocrUsed:true,ocrConfidence:Number(data.confidence||0),ocrPsm:psm,ocrLang:lang,ocrWidth:cw,ocrHeight:ch,ocrRegion:!!region,imageBytes:imageDataUrl.length,imageDataUrl,cornerNonWhite:nonWhite,cornerMean:sample.length?sum/(sample.length/4):255,renderSampleWidth:statW,renderSampleHeight:statH,renderNonWhite:fullNonWhite,renderNonWhiteRatio:fullPixels?fullNonWhite/fullPixels:0,renderMean:fullPixels?fullSum/fullPixels:255,renderMin:fullMin,renderMax:fullMax};
     diag({stage:'ocr',psm,lang,chars:result.text.length,words:result.words.length,confidence:result.ocrConfidence,width:cw,height:ch,imageBytes:result.imageBytes,cornerNonWhite:result.cornerNonWhite,cornerMean:result.cornerMean,renderSampleWidth:statW,renderSampleHeight:statH,renderNonWhite:fullNonWhite,renderNonWhiteRatio:result.renderNonWhiteRatio,renderMean:result.renderMean,renderMin:result.renderMin,renderMax:result.renderMax,region:!!region,sample:result.text.slice(0,300)});
     return result;
   }
@@ -408,7 +426,7 @@ const FurusatoGoogleDrive = (() => {
     const minChars=type==='withholding'?80:(type==='bonus'?100:120);
     let structuralOk=(base.textItemCount||0)>=8 && raw.length>=minChars;
     try{
-      if(type==='salary'){const q=parseSalaryComponents(base);structuralOk=structuralOk&&q.taxableGross!=null&&!q.needsReview;}
+      if(type==='salary'){const q=parseSalaryComponents(base);const socialOk=Object.values(q.socialComponents||{}).length===6&&Object.values(q.socialComponents||{}).every(v=>Number.isFinite(Number(v)));structuralOk=structuralOk&&q.taxableGross!=null&&!q.needsReview&&socialOk;}
       else if(type==='bonus'){const q=parseBonusPdf(base,name);structuralOk=structuralOk&&q.date&&q.amount!=null&&!q.needsReview;}
       else if(type==='withholding'){const q=parseWithholdingPdf(base,name);structuralOk=structuralOk&&q.year!=null&&q.annualSalary!=null&&q.incomeTax!=null&&q.social!=null&&!q.needsReview;}
     }catch{structuralOk=false}
@@ -951,11 +969,18 @@ const FurusatoGoogleDrive = (() => {
       // could overwrite a correct taxable amount and make a valid salary fail.
       const socialKeys=REQUIRED_SOCIAL_COMPONENTS;
       const mergedSocial={};
+      const regionSocial=f?.socialComponents||{};
+      const regionSocialComplete=socialKeys.every(k=>Number.isFinite(Number(regionSocial[k])));
       for(const k of socialKeys){
         const cv=c.socialComponents?.[k];
         const ov=o.socialComponents?.[k];
-        const fv=f.socialComponents?.[k];
-        mergedSocial[k]=cv!=null&&Number.isFinite(Number(cv))?Number(cv):(ov!=null&&Number.isFinite(Number(ov))?Number(ov):(fv!=null&&Number.isFinite(Number(fv))?Number(fv):null));
+        const fv=regionSocial[k];
+        // When the dedicated social-insurance crop was actually OCR'd, it is
+        // the authoritative source for this column. The ordinary parser can
+        // accidentally grab a neighbouring amount (commuting allowance, tax,
+        // resident tax, etc.) when the Japanese label is missing from the PDF
+        // text layer. Never let that false positive override the dedicated crop.
+        mergedSocial[k]=regionSocialComplete&&Number.isFinite(Number(fv))?Number(fv):(cv!=null&&Number.isFinite(Number(cv))?Number(cv):(ov!=null&&Number.isFinite(Number(ov))?Number(ov):(fv!=null&&Number.isFinite(Number(fv))?Number(fv):null)));
       }
       const mergedSocialVals=socialKeys.map(k=>mergedSocial[k]);
       const mergedSocialTotal=mergedSocialVals.every(v=>Number.isFinite(v))?mergedSocialVals.reduce((a,v)=>a+v,0):null;
@@ -1307,7 +1332,7 @@ const FurusatoGoogleDrive = (() => {
     state.bonusRecords=(state.bonusRecords||[]).filter(x=>x.source==='manual'||Number(x.year||String(x.date||'').slice(0,4))===targetYear);
     for(const f of files){
       try{
-        const cached=await cachedOrParsed(f); const pdf=cached.pdf; const x=cached.x; const type=cached.type; if(cached.cacheHit)result.cacheHits++;else{result.cacheMisses++;result.downloads++;result.parsed++;} onProgress?.(`${cached.cacheHit?'保存済みを使用':'解析・更新'}: ${f.name}`); const text=pdf.text; const detail={name:f.name,id:f.id,type:f.candidateType,filenameYear:f.filenameYear||null,detectedType:type,textChars:String(text||'').length,textItemCount:pdf.textItemCount||0,ocrUsed:!!pdf.ocrUsed,ocrConfidence:pdf.ocrConfidence||0,ocrError:pdf.ocrError||'',ocrWordCount:pdf.ocrWordCount||0,ocrValidated:!!pdf.ocrValidated,ocrAttempts:pdf.ocrAttempts||[],pageCount:pdf.pageCount||0,pageMeta:pdf.pageMeta||[],ocrWidth:pdf.ocrWidth||0,ocrHeight:pdf.ocrHeight||0,ocrImageBytes:pdf.imageBytes||0,ocrDebugRegions:Object.keys(pdf.ocrRegions||{}),ocrDebugImagesSaved:!!pdf.ocrDebugImages,ocrCornerNonWhite:pdf.cornerNonWhite||0,ocrCornerMean:pdf.ocrCornerMean||0}; state.importFileDetails.push(detail);
+        const cached=await cachedOrParsed(f); const pdf=cached.pdf; const x=cached.x; const type=cached.type; if(cached.cacheHit)result.cacheHits++;else{result.cacheMisses++;result.downloads++;result.parsed++;} onProgress?.(`${cached.cacheHit?'保存済みを使用':'解析・更新'}: ${f.name}`); const text=pdf.text; const detail={name:f.name,id:f.id,type:f.candidateType,filenameYear:f.filenameYear||null,detectedType:type,textChars:String(text||'').length,textItemCount:pdf.textItemCount||0,ocrUsed:!!pdf.ocrUsed,ocrConfidence:pdf.ocrConfidence||0,ocrError:pdf.ocrError||'',ocrWordCount:pdf.ocrWordCount||0,ocrValidated:!!pdf.ocrValidated,ocrAttempts:pdf.ocrAttempts||[],pageCount:pdf.pageCount||0,pageMeta:pdf.pageMeta||[],ocrWidth:pdf.ocrWidth||0,ocrHeight:pdf.ocrHeight||0,ocrImageBytes:pdf.imageBytes||0,ocrDebugRegions:Object.keys(pdf.ocrRegions||{}),ocrDebugImagesSaved:Number(pdf.debugImagesSaved||0),ocrCornerNonWhite:pdf.cornerNonWhite||0,ocrCornerMean:pdf.ocrCornerMean||0}; state.importFileDetails.push(detail);
         if(type==='salary_slip'){
           Object.assign(detail,{year:x.year||null,month:x.month||null,gross:x.gross||0,taxableGross:x.taxableGross||0,grossTotal:x.grossTotal||0,nonTaxableTotal:x.nonTaxableTotal||0,social:x.social||0,components:x.components||{},socialComponents:x.socialComponents||{},needsReview:!!x.needsReview,registrationCore:!!(x.year&&x.month&&Number(x.taxableGross)>0)}); x.ocrUsed=!!pdf.ocrUsed; if(x.ocrUsed)result.salaryOcr++; x.ocrConfidence=pdf.ocrConfidence||0; x.textItemCount=pdf.textItemCount||0; x.textChars=String(pdf.text||'').length; x.ocrError=pdf.ocrError||''; const inScope=[targetYear,priorYear].includes(Number(x.year));
           if(!inScope){result.skipped++; recordHistory(state,{at:new Date().toISOString(),name:f.name,type:'salary',year:x.year||f.filenameYear||null,status:'対象外',reason:'対象年/前年ではない'});continue}
@@ -1348,7 +1373,7 @@ const FurusatoGoogleDrive = (() => {
     return result;
   }
   async function getCachedSourceEntries(){const db=await openImportCache();if(!db)return[];return new Promise(resolve=>{try{const tx=db.transaction('files','readonly'),st=tx.objectStore('files'),q=st.getAll();q.onsuccess=()=>resolve(q.result||[]);q.onerror=()=>resolve([])}catch{resolve([])}})}
-  return {CLIENT_KEY,getClientId,setClientId,ready,authorize,signOut,listCandidateFiles,scanAndImport,classifyPdfText,parseSalaryPdf,parseBonusPdf,parseWithholdingPdf,extractLabeledNumber,extractToyotaPayrollAmount,extractExactYenAfterLabel,upsertSalaryRecord,upsertBonusRecord,ensurePdfText,getRuntimeDiagnostics,clearRuntimeDiagnostics,getLastOcrImageDataUrl:()=>lastOcrImageDataUrl,getLatestOcrDebugImage:getLatestDebugImage,getOcrDebugImages:getDebugImages,getCachedSourceEntries};
+  return {CLIENT_KEY,getClientId,setClientId,ready,authorize,signOut,listCandidateFiles,scanAndImport,classifyPdfText,parseSalaryPdf,parseBonusPdf,parseWithholdingPdf,extractLabeledNumber,extractToyotaPayrollAmount,extractExactYenAfterLabel,upsertSalaryRecord,upsertBonusRecord,ensurePdfText,getRuntimeDiagnostics,clearRuntimeDiagnostics,getLastOcrImageDataUrl:()=>lastOcrImageDataUrl,getLatestOcrDebugImage:getLatestDebugImage,getOcrDebugImages:getDebugImages,getOcrDebugImageMeta:getDebugImageMeta,getCachedSourceEntries};
 })();
 if(typeof window!=='undefined')window.FurusatoGoogleDrive=FurusatoGoogleDrive;
 if(typeof module!=='undefined')module.exports={FurusatoImport,FurusatoGoogleDrive};
