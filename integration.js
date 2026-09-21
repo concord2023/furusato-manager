@@ -144,7 +144,7 @@ const FurusatoGoogleDrive = (() => {
   // This is deliberately separate from furusatoState: payroll state is the calculation
   // snapshot, while this store is the source-document cache.
   const IMPORT_CACHE_DB='furusatoSourceCache';
-  const IMPORT_CACHE_VERSION='20260921-source-audit-4';
+  const IMPORT_CACHE_VERSION='20260921-source-audit-5';
   function cacheSignature(f){return `${f.id||f.name}|${f.modifiedTime||''}|${f.size||''}`}
   function openImportCache(){return new Promise((resolve,reject)=>{
     if(!('indexedDB' in window))return resolve(null);
@@ -495,7 +495,7 @@ const FurusatoGoogleDrive = (() => {
               let acc='';
               for(let j=i;j<Math.min(items.length,i+12);j++){
                 acc+=items[j].str;
-                if(matchesLabel(acc,label)){
+                if(normalizeLabel(acc).includes(label) && !(label==='taxableamount' && normalizeLabel(acc).includes('nontaxableamount'))){
                   hits.push({x:items[j].x+items[j].width,y:line.y});
                   break;
                 }
