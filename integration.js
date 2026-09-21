@@ -144,12 +144,13 @@ const FurusatoGoogleDrive = (() => {
   // This is deliberately separate from furusatoState: payroll state is the calculation
   // snapshot, while this store is the source-document cache.
   const IMPORT_CACHE_DB='furusatoSourceCache';
-  const IMPORT_CACHE_VERSION='20260921-source-audit-6';
+  const IMPORT_CACHE_VERSION='20260921-source-audit-7';
+  const IMPORT_CACHE_DB_VERSION=2;
   function cacheSignature(f){return `${f.id||f.name}|${f.modifiedTime||''}|${f.size||''}`}
   function openImportCache(){return new Promise((resolve,reject)=>{
     if(!('indexedDB' in window))return resolve(null);
-    let req; try{req=indexedDB.open(IMPORT_CACHE_DB,1)}catch(e){return resolve(null)}
-    req.onupgradeneeded=()=>{try{const db=req.result;if(!db.objectStoreNames.contains('files'))db.createObjectStore('files',{keyPath:'id'})}catch{}};
+    let req; try{req=indexedDB.open(IMPORT_CACHE_DB,IMPORT_CACHE_DB_VERSION)}catch(e){return resolve(null)}
+    req.onupgradeneeded=()=>{try{const db=req.result;if(!db.objectStoreNames.contains('files'))db.createObjectStore('files',{keyPath:'id'});if(!db.objectStoreNames.contains('debugImages'))db.createObjectStore('debugImages',{keyPath:'id'})}catch{}};
     req.onsuccess=()=>resolve(req.result); req.onerror=()=>resolve(null);
   })}
   function canonicalCachedType(f,storedType){
@@ -183,7 +184,31 @@ const FurusatoGoogleDrive = (() => {
     const db=await openImportCache(); if(!db)return null;
     return new Promise(resolve=>{try{const tx=db.transaction('files','readonly'),st=tx.objectStore('files'),q=st.get(String(f.id||f.name));q.onsuccess=()=>{const v=q.result; if(!v||v.version!==IMPORT_CACHE_VERSION||v.signature!==cacheSignature(f)||!cachedRecordComplete(f,v)){resolve(null);return;} const x=v.x||{}; const type=canonicalCachedType(f,v.type); resolve({...v,x,type})};q.onerror=()=>resolve(null)}catch{resolve(null)}});
   }
-  function cacheSafePdf(pdf){ if(!pdf||typeof pdf!=='object')return pdf; const {pdfDoc,...rest}=pdf; return rest; }
+  function stripCachePayload(v){
+    if(Array.isArray(v))return v.map(stripCachePayload);
+    if(!v||typeof v!=='object')return v;
+    const out={};
+    for(const [k,val] of Object.entries(v)){
+      if(k==='pdfDoc'||k==='imageDataUrl'||k==='ocrDebugImages')continue;
+      out[k]=stripCachePayload(val);
+    }
+    return out;
+  }
+  function cacheSafePdf(pdf){ return stripCachePayload(pdf); }
+  async function saveDebugImageRecord(f,region,dataUrl){
+    if(!dataUrl)return; const db=await openImportCache(); if(!db)return;
+    await new Promise(resolve=>{try{const tx=db.transaction('debugImages','readwrite');tx.objectStore('debugImages').put({id:`${String(f.id||f.name)}|${region}`,name:f.name,fileId:String(f.id||''),region,dataUrl,signature:cacheSignature(f),storedAt:new Date().toISOString()});tx.oncomplete=()=>resolve();tx.onerror=()=>resolve();tx.onabort=()=>resolve()}catch{resolve()}});
+    // Keep a small rolling set so iPhone storage does not grow indefinitely.
+    try{const all=await new Promise(resolve=>{const tx=db.transaction('debugImages','readonly'),st=tx.objectStore('debugImages'),q=st.getAll();q.onsuccess=()=>resolve(q.result||[]);q.onerror=()=>resolve([])});if(all.length>12){all.sort((a,b)=>String(a.storedAt).localeCompare(String(b.storedAt)));const tx=db.transaction('debugImages','readwrite'),st=tx.objectStore('debugImages');for(const x of all.slice(0,all.length-12))st.delete(x.id)}}catch{}
+  }
+  async function saveDebugImages(f,pdf){
+    const imgs=pdf?.ocrDebugImages||{};
+    if(imgs.full)await saveDebugImageRecord(f,'full',imgs.full);
+    if(imgs.salarySocial)await saveDebugImageRecord(f,'salarySocial',imgs.salarySocial);
+    if(imgs.salarySummary)await saveDebugImageRecord(f,'salarySummary',imgs.salarySummary);
+  }
+  async function getDebugImages(){const db=await openImportCache();if(!db)return[];return new Promise(resolve=>{try{const tx=db.transaction('debugImages','readonly'),st=tx.objectStore('debugImages'),q=st.getAll();q.onsuccess=()=>resolve((q.result||[]).sort((a,b)=>String(b.storedAt).localeCompare(String(a.storedAt))));q.onerror=()=>resolve([])}catch{resolve([])}})}
+  async function getLatestDebugImage(preferRegion='salarySocial'){const all=await getDebugImages();return all.find(x=>x.region===preferRegion)?.dataUrl||all[0]?.dataUrl||null}
   async function putCachedParsed(f,pdf,x,type){
     const db=await openImportCache(); if(!db)return;
     await new Promise(resolve=>{try{const tx=db.transaction('files','readwrite');tx.objectStore('files').put({id:String(f.id||f.name),version:IMPORT_CACHE_VERSION,signature:cacheSignature(f),name:f.name,type:canonicalCachedType(f,type),storedAt:new Date().toISOString(),pdf:cacheSafePdf(pdf),x});tx.oncomplete=()=>resolve();tx.onerror=()=>resolve();tx.onabort=()=>resolve()}catch{resolve()}});
@@ -197,6 +222,7 @@ const FurusatoGoogleDrive = (() => {
     if(type==='salary_slip')x=parseSalaryPdf(pdf,f.name);
     else if(type==='bonus_slip')x=parseBonusPdf(pdf,f.name);
     else if(type==='withholding')x=parseWithholdingPdf(pdf,f.name);
+    await saveDebugImages(f,pdf);
     await putCachedParsed(f,pdf,x,type);
     return {pdf,x,type,cacheHit:false};
   }
@@ -407,8 +433,8 @@ const FurusatoGoogleDrive = (() => {
         // Different view of the problem: these older Toyota slips can be image-only,
         // and full-page OCR is unreliable because the table ruling dominates the page.
         // OCR the two numeric blocks directly after removing the ruling lines.
-        try{salarySocialRegion=await ocrPageFromPdfDoc(base.pdfDoc,{x0:.21,y0:.22,x1:.43,y1:.55},{scale:4,psm:6,lang:'jpn+eng',cleanTable:true});attempts.push(salarySocialRegion)}catch(e){diag({stage:'ocrRegionError',type,name,region:'salarySocial',error:e?.message||String(e)})}
-        try{salarySummaryRegion=await ocrPageFromPdfDoc(base.pdfDoc,{x0:.00,y0:.80,x1:.48,y1:1},{scale:4,psm:6,lang:'jpn+eng',cleanTable:true});attempts.push(salarySummaryRegion)}catch(e){diag({stage:'ocrRegionError',type,name,region:'salarySummary',error:e?.message||String(e)})}
+        try{salarySocialRegion=await ocrPageFromPdfDoc(base.pdfDoc,{x0:.30,y0:.235,x1:.46,y1:.55},{scale:4,psm:6,lang:'eng'});attempts.push(salarySocialRegion)}catch(e){diag({stage:'ocrRegionError',type,name,region:'salarySocial',error:e?.message||String(e)})}
+        try{salarySummaryRegion=await ocrPageFromPdfDoc(base.pdfDoc,{x0:.00,y0:.80,x1:.48,y1:1},{scale:4,psm:6,lang:'eng'});attempts.push(salarySummaryRegion)}catch(e){diag({stage:'ocrRegionError',type,name,region:'salarySummary',error:e?.message||String(e)})}
       } else if(ocrQuality(attempts.map(x=>x.text).join('\n'),Math.max(...attempts.map(x=>x.ocrConfidence||0)))<260){
         // Numeric fields on non-salary documents can still benefit from the
         // English fallback, but salary now uses the dedicated table crops above.
@@ -440,7 +466,7 @@ const FurusatoGoogleDrive = (() => {
       const wordSource=valid.find(x=>!x.ocrRegion&&Array.isArray(x.words)&&x.words.length)
         ||nonEmpty.find(x=>!x.ocrRegion&&Array.isArray(x.words)&&x.words.length)
         ||best;
-      return {...base,text:mergedText,ocrText:mergedText,ocrUsed:true,ocrConfidence:Math.max(...attempts.map(x=>Number(x.ocrConfidence||0))),ocrPsm:attempts.map(x=>x.ocrPsm).join(','),ocrWords:wordSource.words||[],ocrWordCount:Array.isArray(wordSource.words)?wordSource.words.length:0,ocrWidth:wordSource.ocrWidth,ocrHeight:wordSource.ocrHeight,ocrAttempts:attempts.map(x=>({psm:x.ocrPsm,lang:x.ocrLang,chars:String(x.text||'').length,confidence:x.ocrConfidence||0,words:Array.isArray(x.words)?x.words.length:0,valid:valid.includes(x)})),ocrValidated:valid.length>0,ocrRegions:type==='salary'?{salarySocial:salarySocialRegion,salarySummary:salarySummaryRegion}:undefined};
+      return {...base,text:mergedText,ocrText:mergedText,ocrUsed:true,ocrConfidence:Math.max(...attempts.map(x=>Number(x.ocrConfidence||0))),ocrPsm:attempts.map(x=>x.ocrPsm).join(','),ocrWords:wordSource.words||[],ocrWordCount:Array.isArray(wordSource.words)?wordSource.words.length:0,ocrWidth:wordSource.ocrWidth,ocrHeight:wordSource.ocrHeight,ocrAttempts:attempts.map(x=>({psm:x.ocrPsm,lang:x.ocrLang,chars:String(x.text||'').length,confidence:x.ocrConfidence||0,words:Array.isArray(x.words)?x.words.length:0,valid:valid.includes(x)})),ocrValidated:valid.length>0,ocrRegions:type==='salary'?{salarySocial:salarySocialRegion,salarySummary:salarySummaryRegion}:undefined,ocrDebugImages:{full:attempts.find(x=>!x.ocrRegion)?.imageDataUrl||null,salarySocial:salarySocialRegion?.imageDataUrl||null,salarySummary:salarySummaryRegion?.imageDataUrl||null}};
     }catch(e){diag({stage:'ocrError',type,name,error:e?.stack||e?.message||String(e),attempts:attempts.map(x=>({psm:x.ocrPsm,lang:x.ocrLang,chars:String(x.text||'').length,confidence:x.ocrConfidence||0,words:Array.isArray(x.words)?x.words.length:0,sample:String(x.text||'').slice(0,300),width:x.ocrWidth||0,height:x.ocrHeight||0,imageBytes:x.imageBytes||0,cornerNonWhite:x.cornerNonWhite||0,cornerMean:x.cornerMean||0}))});return {...base,text:raw,ocrText:'',ocrUsed:true,ocrError:e?.message||String(e),ocrAttempts:attempts.map(x=>({psm:x.ocrPsm,lang:x.ocrLang,chars:String(x.text||'').length,confidence:x.ocrConfidence||0,words:Array.isArray(x.words)?x.words.length:0,valid:false})),ocrValidated:false};}
     return {...base,text:raw,ocrUsed:true,ocrError:'OCR結果が空でした'};
   }
@@ -1281,7 +1307,7 @@ const FurusatoGoogleDrive = (() => {
     state.bonusRecords=(state.bonusRecords||[]).filter(x=>x.source==='manual'||Number(x.year||String(x.date||'').slice(0,4))===targetYear);
     for(const f of files){
       try{
-        const cached=await cachedOrParsed(f); const pdf=cached.pdf; const x=cached.x; const type=cached.type; if(cached.cacheHit)result.cacheHits++;else{result.cacheMisses++;result.downloads++;result.parsed++;} onProgress?.(`${cached.cacheHit?'保存済みを使用':'解析・更新'}: ${f.name}`); const text=pdf.text; const detail={name:f.name,id:f.id,type:f.candidateType,filenameYear:f.filenameYear||null,detectedType:type,textChars:String(text||'').length,textItemCount:pdf.textItemCount||0,ocrUsed:!!pdf.ocrUsed,ocrConfidence:pdf.ocrConfidence||0,ocrError:pdf.ocrError||'',ocrWordCount:pdf.ocrWordCount||0,ocrValidated:!!pdf.ocrValidated,ocrAttempts:pdf.ocrAttempts||[],pageCount:pdf.pageCount||0,pageMeta:pdf.pageMeta||[],ocrWidth:pdf.ocrWidth||0,ocrHeight:pdf.ocrHeight||0,ocrImageBytes:pdf.imageBytes||0,ocrCornerNonWhite:pdf.cornerNonWhite||0,ocrCornerMean:pdf.ocrCornerMean||0}; state.importFileDetails.push(detail);
+        const cached=await cachedOrParsed(f); const pdf=cached.pdf; const x=cached.x; const type=cached.type; if(cached.cacheHit)result.cacheHits++;else{result.cacheMisses++;result.downloads++;result.parsed++;} onProgress?.(`${cached.cacheHit?'保存済みを使用':'解析・更新'}: ${f.name}`); const text=pdf.text; const detail={name:f.name,id:f.id,type:f.candidateType,filenameYear:f.filenameYear||null,detectedType:type,textChars:String(text||'').length,textItemCount:pdf.textItemCount||0,ocrUsed:!!pdf.ocrUsed,ocrConfidence:pdf.ocrConfidence||0,ocrError:pdf.ocrError||'',ocrWordCount:pdf.ocrWordCount||0,ocrValidated:!!pdf.ocrValidated,ocrAttempts:pdf.ocrAttempts||[],pageCount:pdf.pageCount||0,pageMeta:pdf.pageMeta||[],ocrWidth:pdf.ocrWidth||0,ocrHeight:pdf.ocrHeight||0,ocrImageBytes:pdf.imageBytes||0,ocrDebugRegions:Object.keys(pdf.ocrRegions||{}),ocrDebugImagesSaved:!!pdf.ocrDebugImages,ocrCornerNonWhite:pdf.cornerNonWhite||0,ocrCornerMean:pdf.ocrCornerMean||0}; state.importFileDetails.push(detail);
         if(type==='salary_slip'){
           Object.assign(detail,{year:x.year||null,month:x.month||null,gross:x.gross||0,taxableGross:x.taxableGross||0,grossTotal:x.grossTotal||0,nonTaxableTotal:x.nonTaxableTotal||0,social:x.social||0,components:x.components||{},socialComponents:x.socialComponents||{},needsReview:!!x.needsReview,registrationCore:!!(x.year&&x.month&&Number(x.taxableGross)>0)}); x.ocrUsed=!!pdf.ocrUsed; if(x.ocrUsed)result.salaryOcr++; x.ocrConfidence=pdf.ocrConfidence||0; x.textItemCount=pdf.textItemCount||0; x.textChars=String(pdf.text||'').length; x.ocrError=pdf.ocrError||''; const inScope=[targetYear,priorYear].includes(Number(x.year));
           if(!inScope){result.skipped++; recordHistory(state,{at:new Date().toISOString(),name:f.name,type:'salary',year:x.year||f.filenameYear||null,status:'対象外',reason:'対象年/前年ではない'});continue}
@@ -1322,7 +1348,7 @@ const FurusatoGoogleDrive = (() => {
     return result;
   }
   async function getCachedSourceEntries(){const db=await openImportCache();if(!db)return[];return new Promise(resolve=>{try{const tx=db.transaction('files','readonly'),st=tx.objectStore('files'),q=st.getAll();q.onsuccess=()=>resolve(q.result||[]);q.onerror=()=>resolve([])}catch{resolve([])}})}
-  return {CLIENT_KEY,getClientId,setClientId,ready,authorize,signOut,listCandidateFiles,scanAndImport,classifyPdfText,parseSalaryPdf,parseBonusPdf,parseWithholdingPdf,extractLabeledNumber,extractToyotaPayrollAmount,extractExactYenAfterLabel,upsertSalaryRecord,upsertBonusRecord,ensurePdfText,getRuntimeDiagnostics,clearRuntimeDiagnostics,getLastOcrImageDataUrl:()=>lastOcrImageDataUrl,getCachedSourceEntries};
+  return {CLIENT_KEY,getClientId,setClientId,ready,authorize,signOut,listCandidateFiles,scanAndImport,classifyPdfText,parseSalaryPdf,parseBonusPdf,parseWithholdingPdf,extractLabeledNumber,extractToyotaPayrollAmount,extractExactYenAfterLabel,upsertSalaryRecord,upsertBonusRecord,ensurePdfText,getRuntimeDiagnostics,clearRuntimeDiagnostics,getLastOcrImageDataUrl:()=>lastOcrImageDataUrl,getLatestOcrDebugImage:getLatestDebugImage,getOcrDebugImages:getDebugImages,getCachedSourceEntries};
 })();
 if(typeof window!=='undefined')window.FurusatoGoogleDrive=FurusatoGoogleDrive;
 if(typeof module!=='undefined')module.exports={FurusatoImport,FurusatoGoogleDrive};
