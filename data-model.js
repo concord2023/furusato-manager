@@ -117,6 +117,18 @@ const FurusatoModel = (() => {
     // Rebuild the forecast one final time after every migration above.  This is
     // intentionally after the legacy migration: otherwise a migrated 8-month
     // state could keep an old 3-month forecast and make December display 0.
+    const rebuildBonusForecastSocial=()=>{
+      const targetYear=Number(s.importSettings?.targetYear||s.year||new Date().getFullYear()); const healthCap=5730000;
+      const fiscal=(year,month)=>Number(month)>=4?Number(year):Number(year)-1;
+      const actualFor=rec=>{const month=Number(rec.month||String(rec.date||'').slice(5,7))||12; const fy=fiscal(targetYear,month); return (s.bonusRecords||[]).filter(r=>r.status==='actual'&&Number(r.amount)>0&&fiscal(Number(r.year||String(r.date||'').slice(0,4)),Number(r.month||String(r.date||'').slice(5,7)))===fy)};
+      (s.bonusSocialRecords||[]).filter(r=>r.status==='forecast').forEach(rec=>{
+        const prior=(s.priorBonusRecords||[]).find(r=>(r.season||'')===(rec.season||'')); const amount=Math.max(0,Number(prior?.amount)||0); if(!amount)return;
+        const actual=actualFor(rec); const used=actual.reduce((a,r)=>a+Math.min(healthCap,Number(r.standardBonusHealth)||Number(r.amount)||0),0); const standardHealth=Math.max(0,Math.min(Math.floor(amount/1000)*1000,healthCap-used)); const standardPension=Math.min(Math.floor(amount/1000)*1000,1500000);
+        const ref=[...actual,...(s.priorBonusRecords||[])].sort((a,b)=>String(b.date||'').localeCompare(String(a.date||''))).find(r=>Object.values(r.socialComponents||{}).some(v=>Number(v)>0))||null; const refBase=Number(ref?.standardBonusHealth)||Number(ref?.amount)||0; const c=ref?.socialComponents||{}; const rate=k=>refBase>0&&Number(c[k])>0?Number(c[k])/refBase:0;
+        const components={employmentInsurance:Math.floor(amount*0.005),healthInsurance:Math.floor(standardHealth*rate('healthInsurance')),healthInsuranceSpecial:Math.floor(standardHealth*rate('healthInsuranceSpecial')),nursingCare:Math.floor(standardHealth*rate('nursingCare')),childSupport:Math.floor(standardHealth*0.00115),pension:Math.floor(standardPension*0.0915)};
+        rec.amount=Object.values(components).reduce((a,v)=>a+(Number(v)||0),0); rec.components=components; rec.standardBonusHealth=standardHealth; rec.standardBonusPension=standardPension; rec.note=`${targetYear}年の実績賞与と制度上限を反映して予測。雇用保険0.5%、厚生年金18.3%の本人負担9.15%、子ども・子育て支援金0.23%の本人負担0.115%を適用。健康保険系は対象年の実績賞与から本人負担率を算出。`;
+      });
+    };
     const rebuildForecast=()=>{
       const actualMonths=(s.salaryRecords||[]).filter(r=>r.status==='actual'&&Number(r.month)>=1&&Number(r.month)<=12&&Number(r.taxableGross??r.gross)>0).map(r=>Number(r.month));
       s.actualThrough=actualMonths.length?Math.max(...actualMonths):0;
@@ -131,6 +143,7 @@ const FurusatoModel = (() => {
       s.forecastSocial=Array.from({length:Math.max(0,12-s.actualThrough)},()=>socialAvg);
     };
     rebuildForecast();
+    rebuildBonusForecastSocial();
     return s;
   }
   const IMPORT_HISTORY_KEY='furusatoImportHistory';

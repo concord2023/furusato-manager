@@ -1103,6 +1103,22 @@ const FurusatoGoogleDrive = (() => {
     }
     return null;
   }
+  function estimateBonusSocialForecast(state,base){
+    const amount=Math.max(0,Number(base.amount)||0);
+    const targetYear=Number(state.importSettings?.targetYear||state.year||new Date().getFullYear());
+    const month=Number(base.month||String(base.date||'').slice(5,7))||12;
+    const fiscalYear=month>=4?targetYear:targetYear-1;
+    const actual=(state.bonusRecords||[]).filter(r=>r.status==='actual'&&Number(r.amount)>0&&((Number(r.month||String(r.date||'').slice(5,7))>=4?Number(r.year||String(r.date||'').slice(0,4)):Number(r.year||String(r.date||'').slice(0,4))-1)===fiscalYear));
+    const healthCap=5730000;
+    const healthUsed=actual.reduce((a,r)=>a+Math.min(healthCap,Number(r.standardBonusHealth)||Number(r.amount)||0),0);
+    const standardBonusHealth=Math.max(0,Math.min(Math.floor(amount/1000)*1000,healthCap-healthUsed));
+    const standardBonusPension=Math.min(Math.floor(amount/1000)*1000,1500000);
+    const ref=[...actual,...(state.priorBonusRecords||[])].sort((a,b)=>String(b.date||'').localeCompare(String(a.date||''))).find(r=>Object.values(r.socialComponents||{}).some(v=>Number(v)>0)) || null;
+    const comp=ref?.socialComponents||{}; const refBase=Number(ref?.standardBonusHealth)||Number(ref?.amount)||0;
+    const rate=k=>refBase>0&&Number(comp[k])>0?Number(comp[k])/refBase:0;
+    const components={employmentInsurance:Math.floor(amount*0.005),healthInsurance:Math.floor(standardBonusHealth*rate('healthInsurance')),healthInsuranceSpecial:Math.floor(standardBonusHealth*rate('healthInsuranceSpecial')),nursingCare:Math.floor(standardBonusHealth*rate('nursingCare')),childSupport:Math.floor(standardBonusHealth*0.00115),pension:Math.floor(standardBonusPension*0.0915)};
+    return {total:Object.values(components).reduce((a,v)=>a+(Number(v)||0),0),components,standardBonusHealth,standardBonusPension};
+  }
   function bonusSeason(month){
     const m=Number(month)||0;
     // Toyotaの年2回賞与を前提に、夏（5〜9月）・冬（10〜2月）の2枠で管理。
@@ -1317,7 +1333,7 @@ const FurusatoGoogleDrive = (() => {
       if(currentSeason.length)continue;
       const priorSeason=priorBonus.filter(x=>season(bonusMonth(x))===s);
       forecastBonus+=priorSeason.reduce((a,x)=>a+(Number(x.amount)||0),0);
-      priorSeason.forEach(x=>{if(x.social!=null)state.bonusSocialRecords.push({date:`${targetYear}-${String(bonusMonth(x)).padStart(2,'0')}`,month:bonusMonth(x),amount:Number(x.social)||0,components:x.socialComponents||{},standardBonusHealth:x.standardBonusHealth,standardBonusPension:x.standardBonusPension,source:'prior-year-reference',status:'forecast',document:x.document,note:`${priorYear}年${s==='summer'?'夏':'冬'}賞与の社会保険料を参考`,needsReview:false})});
+      priorSeason.forEach(x=>{const forecastDate=`${targetYear}-${String(bonusMonth(x)).padStart(2,'0')}`; const forecastSocial=estimateBonusSocialForecast(state,{...x,date:forecastDate,month:bonusMonth(x),season:s}); state.bonusSocialRecords.push({date:forecastDate,month:bonusMonth(x),season:s,amount:forecastSocial.total,components:forecastSocial.components,standardBonusHealth:forecastSocial.standardBonusHealth,standardBonusPension:forecastSocial.standardBonusPension,source:'prior-year-reference',status:'forecast',document:x.document,note:`${priorYear}年${s==='summer'?'夏':'冬'}賞与を金額予測の参考にし、${targetYear}年の賞与保険料率・上限で再計算`,needsReview:false})});
     }
     state.forecastBonus=forecastBonus;
     state.actualThrough=actualThrough;
