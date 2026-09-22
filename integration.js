@@ -145,7 +145,7 @@ const FurusatoGoogleDrive = (() => {
   // This is deliberately separate from furusatoState: payroll state is the calculation
   // snapshot, while this store is the source-document cache.
   const IMPORT_CACHE_DB='furusatoSourceCache';
-  const IMPORT_CACHE_VERSION='20260922-import-persist-2';
+  const IMPORT_CACHE_VERSION='20260922-import-persist-3';
   const IMPORT_CACHE_DB_VERSION=3;
   function cacheSignature(f){return `${f.id||f.name}|${f.modifiedTime||''}|${f.size||''}`}
   function openImportCache(){return new Promise((resolve,reject)=>{
@@ -775,7 +775,7 @@ const FurusatoGoogleDrive = (() => {
           const ch=rawLine[rawPos++]; if(/[ \t\r\u3000()（）]/.test(ch))continue; normPos++;
         }
         const after=rawLine.slice(rawPos);
-        for(const v of extractNumericTokens(after)){if(v.n>=1900&&v.n<=2100)continue;return v.n;}
+        for(const v of extractNumericTokens(after)){return v.n;}
         const textTail=after.replace(/[0-9, .\-]/g,'').trim();
         const li=rawLines.indexOf(rawLine);
         // A payroll form often places the value on the next line while another
@@ -785,19 +785,16 @@ const FurusatoGoogleDrive = (() => {
         const nextLine=rawLines[li+1]||'';
         const nextVals=extractNumericTokens(nextLine);
         if(nextVals.length && (textTail.length<=80 || !/[A-Za-z]{3,}/.test(textTail))){
-          for(const v of nextVals){if(v.n>=1900&&v.n<=2100)continue;return v.n;}
+          if(!/20\d{2}\s*[\/-]\s*\d{1,2}\s*[\/-]\s*\d{1,2}/.test(nextLine)){for(const v of nextVals){return v.n;}}
         }
       }
       if(sawLabel)continue;
-      const source=String(raw).replace(/\r/g,''); let from=0;
-      while(true){
-        const compact=norm(source.slice(from)); const pos=compact.indexOf(l); if(pos<0)break;
-        // Last-resort fallback is deliberately narrow; use the raw source after
-        // the matched compact prefix and never accept a year token.
-        const approx=source.slice(from+pos+l.length,from+pos+l.length+180);
-        for(const v of extractNumericTokens(approx)){if(v.n>=1900&&v.n<=2100)continue;return v.n;}
-        from+=pos+l.length;
-      }
+      // Deliberately do NOT scan an arbitrary 180-character window after a
+      // label. Payroll PDFs contain many neighbouring amounts; that fallback
+      // can silently turn an unrelated number (for example a non-taxable amount
+      // or a net-payment amount) into the value for this label. If the label was
+      // present but had no local number, return null and let the dedicated OCR
+      // recovery path handle it.
     }
     return null;
   }
@@ -811,7 +808,7 @@ const FurusatoGoogleDrive = (() => {
         // Only accept a numeric token on the same OCR line. This deliberately
         // avoids the header occurrence "Taxable amount from January".
         const tail=nl.slice(idx+l.length);
-        for(const v of extractNumericTokens(tail)){if(v.n>=1900&&v.n<=2100)continue;return v.n;}
+        for(const v of extractNumericTokens(tail)){return v.n;}
       }
     }
     return null;
@@ -976,6 +973,14 @@ const FurusatoGoogleDrive = (() => {
       grossComponents.push({label:'通勤費補助',amount:commuting,taxTreatment:taxable!=null?'mixed':'unknown',taxableAmount:taxable,nonTaxableAmount:nonTaxable,source:'explicit'});
     }
     if(stockSubsidy!=null)grossComponents.push({label:'持株会補助手当',amount:stockSubsidy,taxTreatment:'taxable',source:'explicit'});
+    // Toyota monthly slips do not expose a reliable text-layer 「支給合計」
+    // field; 「合計」 belongs to the base-pay breakdown. When no explicit total
+    // was found, derive the payment total from the actual payment-detail rows.
+    // This prevents unrelated amounts such as net pay from becoming grossTotal.
+    if(grossTotal==null){
+      const grossParts=[base,commuting,stockSubsidy].filter(v=>Number.isFinite(v));
+      if(grossParts.length>=1)grossTotal=grossParts.reduce((a,v)=>a+v,0);
+    }
     const unknown=[];
     if(grossTotal==null)unknown.push('支給合計');
     if(nonTaxableTotal==null)unknown.push('非課税分');
@@ -983,7 +988,7 @@ const FurusatoGoogleDrive = (() => {
     if(socialTotal==null)unknown.push('社会保険料');
     const arithmeticOk=derivedTaxable!=null&&explicitTaxable!=null&&derivedTaxable===explicitTaxable;
     const coreOk=taxableBase!=null&&Number(taxableBase)>0;
-    return {grossTotal,taxableGross:taxableBase,explicitTaxableGross:explicitTaxable,nonTaxableTotal,socialComponents,socialTotal,grossComponents,unknownComponents:unknown,arithmeticOk,coreOk,needsReview:!coreOk};
+    return {grossTotal,taxableGross:taxableBase,explicitTaxableGross:explicitTaxable,nonTaxableTotal,socialComponents,socialTotal,grossComponents,unknownComponents:unknown,arithmeticOk,coreOk,needsReview:!coreOk||socialTotal==null};
   }
   function parseSalaryPdf(text,name){
     const raw=typeof text==='string'?text:(text?.text||'');
@@ -1031,7 +1036,7 @@ const FurusatoGoogleDrive = (() => {
       if(c.taxableGross!=null&&c.nonTaxableTotal!=null&&c.grossTotal==null)c.grossTotal=c.taxableGross+c.nonTaxableTotal;
       const derived=(c.grossTotal!=null&&c.nonTaxableTotal!=null)?c.grossTotal-c.nonTaxableTotal:null;
       const sc=c.socialComponents||{};const socialOk=REQUIRED_SOCIAL_COMPONENTS.every(k=>Number.isFinite(sc[k]))&&(sc.childSupport==null||Number.isFinite(sc.childSupport));
-      c={...c,unknownComponents:[...(c.grossTotal==null?['支給合計']:[]),...(c.nonTaxableTotal==null?['非課税分']:[]),...(c.taxableGross==null?['課税対象額']:[]),...(c.socialTotal==null?['社会保険料']:[])],arithmeticOk:derived!=null&&c.taxableGross===derived&&socialOk,coreOk:Number(c.taxableGross)>0,needsReview:!(Number(c.taxableGross)>0)};
+      c={...c,unknownComponents:[...(c.grossTotal==null?['支給合計']:[]),...(c.nonTaxableTotal==null?['非課税分']:[]),...(c.taxableGross==null?['課税対象額']:[]),...(c.socialTotal==null?['社会保険料']:[])],arithmeticOk:derived!=null&&c.taxableGross===derived&&socialOk,coreOk:Number(c.taxableGross)>0,needsReview:!(Number(c.taxableGross)>0)||!socialOk};
     }
     const taxableGross=Number.isFinite(c.taxableGross)&&c.taxableGross>0?c.taxableGross:null;
     const grossTotal=Number.isFinite(c.grossTotal)&&c.grossTotal>0?c.grossTotal:null;
