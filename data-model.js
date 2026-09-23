@@ -1,7 +1,7 @@
 // Data model and normalization for the ふるさと納税マネージャー.
 const FurusatoModel = (() => {
   const DEFAULT = {
-    schemaVersion: 12, year: new Date().getFullYear(), asOf: new Date().toISOString().slice(0,10), actualThrough: 0, importSettings:{targetYear:new Date().getFullYear(),priorYear:new Date().getFullYear()-1}, importHistory:[],
+    schemaVersion: 14, year: new Date().getFullYear(), asOf: new Date().toISOString().slice(0,10), actualThrough: 0, importSettings:{targetYear:new Date().getFullYear(),priorYear:new Date().getFullYear()-1}, importHistory:[],
     salaryRecords: [],
     yearRecords: {},
     yearPayrollRecords: {},
@@ -49,7 +49,7 @@ const FurusatoModel = (() => {
       s.bonusSocialRecords=clone(DEFAULT.bonusSocialRecords);
     }
     if(Number(raw?.schemaVersion||0)<11){s.deductions=s.deductions||{};s.deductions.incomeAdjustmentOverride=null;s.deductions.specialDependentOverride=null;}
-    s.schemaVersion=12;
+    s.schemaVersion=14;
     s.importSettings=s.importSettings||{targetYear:s.year||2026,priorYear:(s.year||2026)-1};
     s.importSettings.targetYear=Number(s.importSettings.targetYear)||Number(s.year)||2026;
     s.importSettings.priorYear=s.importSettings.targetYear-1;
@@ -101,6 +101,31 @@ const FurusatoModel = (() => {
     // later edits only change that year's manual inputs.
     s.yearRecords=s.yearRecords&&typeof s.yearRecords==='object'&&!Array.isArray(s.yearRecords)?s.yearRecords:{};
     s.yearPayrollRecords=s.yearPayrollRecords&&typeof s.yearPayrollRecords==='object'&&!Array.isArray(s.yearPayrollRecords)?s.yearPayrollRecords:{};
+    // Migrate all legacy prior-year payroll buffers into the permanent year database.
+    const dbYear=(y)=>{const n=Number(y);if(!n)return null;const k=String(n);const a=s.yearPayrollRecords[k]&&typeof s.yearPayrollRecords[k]==='object'?s.yearPayrollRecords[k]:{year:n,salaryRecords:[],socialRecords:[],bonusRecords:[]};a.year=n;a.salaryRecords=Array.isArray(a.salaryRecords)?a.salaryRecords:[];a.socialRecords=Array.isArray(a.socialRecords)?a.socialRecords:[];a.bonusRecords=Array.isArray(a.bonusRecords)?a.bonusRecords:[];a.documents=Array.isArray(a.documents)?a.documents:[];s.yearPayrollRecords[k]=a;return a};
+    const dbMerge=(arr,row,key)=>{const i=arr.findIndex(x=>key(x)===key(row));if(i>=0)arr[i]={...arr[i],...clone(row)};else arr.push(clone(row));};
+    for(const r of s.priorSalaryRecords||[])if(Number(r.year))dbMerge(dbYear(r.year).salaryRecords,r,x=>`${x.month}|${x.document||x.driveFileId||''}`);
+    for(const r of s.priorSocialRecords||[])if(Number(r.year))dbMerge(dbYear(r.year).socialRecords,r,x=>`${x.month}|${x.document||x.driveFileId||''}`);
+    for(const r of s.priorBonusRecords||[])if(Number(r.year))dbMerge(dbYear(r.year).bonusRecords,r,x=>`${x.date||''}|${x.season||''}|${x.document||x.driveFileId||''}`);
+    // Backfill the persistent read-data database from older sourceDocuments/importFileDetails.
+    for(const d of s.sourceDocuments||[]){const y=Number(d.year);if(!y)continue;const a=dbYear(y);if(!a)continue;const key=String(d.driveFileId||d.file||d.name||'');dbMerge(a.documents,d,x=>String(x.driveFileId||x.file||x.name||''));}
+    for(const d of s.importFileDetails||[]){const y=Number(d.year);if(!y)continue;const a=dbYear(y);if(!a)continue;dbMerge(a.documents,d,x=>String(x.id||x.name||''));}
+    // Collapse legacy duplicate monthly rows left by older builds. Latest row wins.
+    for(const a of Object.values(s.yearPayrollRecords)){if(!a||typeof a!=='object')continue;for(const type of ['salaryRecords','socialRecords']){const m=new Map();for(const r of (a[type]||[]))m.set(String(r.month||''),r);a[type]=[...m.values()].filter(r=>r.month);}}
+    // Migrate previously imported withholding documents into the permanent annual record.
+    for(const d of s.sourceDocuments||[]){
+      if(String(d.type||'').toLowerCase()!=='withholding')continue;
+      const y=Number(d.year); if(!y||Number(d.annualSalary)<=0)continue;
+      const prev=s.yearRecords[String(y)]||{};
+      s.yearRecords[String(y)]={...prev,year:y,status:'confirmed',withholding:clone(d),manual:{...(prev.manual||{}),nationalPension:Number(prev.manual?.nationalPension)||0},updatedAt:prev.updatedAt||new Date().toISOString()};
+      if(!s.withholdingRecords.some(w=>Number(w.year)===y))s.withholdingRecords.push(clone(d));
+    }
+    for(const d of s.importFileDetails||[]){
+      if(String(d.type||'').toLowerCase()!=='withholding'&&String(d.detectedType||'').toLowerCase()!=='withholding')continue;
+      const y=Number(d.year); if(!y||Number(d.annualSalary)<=0)continue;
+      const prev=s.yearRecords[String(y)]||{};
+      s.yearRecords[String(y)]={...prev,year:y,status:'confirmed',withholding:clone(d),manual:{...(prev.manual||{}),nationalPension:Number(prev.manual?.nationalPension)||0},updatedAt:prev.updatedAt||new Date().toISOString()};
+    }
     for(const w of s.withholdingRecords){
       const y=Number(w?.year); if(!y||!Number(w?.annualSalary))continue;
       const prev=s.yearRecords[String(y)]||{};
@@ -114,7 +139,7 @@ const FurusatoModel = (() => {
     // This is deliberately separate from the live target-year forecast so changing the Drive
     // search year can never replace the data used by another year's result page.
     const archive={...s.yearPayrollRecords};
-    const ensureArchiveYear=(y)=>{const k=String(Number(y)||0);if(!k||k==='0')return null;const a=archive[k]&&typeof archive[k]==='object'?archive[k]:{};a.year=Number(y);a.salaryRecords=Array.isArray(a.salaryRecords)?a.salaryRecords:[];a.socialRecords=Array.isArray(a.socialRecords)?a.socialRecords:[];a.bonusRecords=Array.isArray(a.bonusRecords)?a.bonusRecords:[];archive[k]=a;return a};
+    const ensureArchiveYear=(y)=>{const k=String(Number(y)||0);if(!k||k==='0')return null;const a=archive[k]&&typeof archive[k]==='object'?archive[k]:{};a.year=Number(y);a.salaryRecords=Array.isArray(a.salaryRecords)?a.salaryRecords:[];a.socialRecords=Array.isArray(a.socialRecords)?a.socialRecords:[];a.bonusRecords=Array.isArray(a.bonusRecords)?a.bonusRecords:[];a.documents=Array.isArray(a.documents)?a.documents:[];archive[k]=a;return a};
     const mergeRow=(arr,row,key)=>{if(!row)return;const i=arr.findIndex(x=>key(x)===key(row));if(i>=0)arr[i]={...arr[i],...clone(row)};else arr.push(clone(row));};
     for(const r of s.salaryRecords||[]){const y=Number(r.year||s.year);if(y)mergeRow(ensureArchiveYear(y).salaryRecords,r,x=>`${x.month}|${x.document||x.driveFileId||x.fileId||''}`)}
     for(const r of s.socialRecords||[]){const y=Number(r.year||s.year);if(y)mergeRow(ensureArchiveYear(y).socialRecords,r,x=>`${x.month}|${x.document||x.driveFileId||x.fileId||''}`)}
@@ -123,6 +148,7 @@ const FurusatoModel = (() => {
     for(const r of s.priorSocialRecords||[]){const y=Number(r.year);if(y)mergeRow(ensureArchiveYear(y).socialRecords,r,x=>`${x.month}|${x.document||x.driveFileId||x.fileId||''}`)}
     for(const r of s.priorBonusRecords||[]){const y=Number(r.year);if(y)mergeRow(ensureArchiveYear(y).bonusRecords,r,x=>`${x.date||''}|${x.season||''}|${x.document||x.driveFileId||''}`)}
     s.yearPayrollRecords=archive;
+    for(const a of Object.values(s.yearPayrollRecords)){if(!a||typeof a!=='object')continue;for(const type of ['salaryRecords','socialRecords']){const m=new Map();for(const r of (a[type]||[]))m.set(String(r.month||''),r);a[type]=[...m.values()].filter(r=>r.month);}}
     s.family=s.family&&typeof s.family==='object'?s.family:{spouse:{exists:false,name:'',income:0,age:null,source:'manual',needsConfirmation:false},dependents:[],priorNote:''};
     s.family.spouse=s.family.spouse&&typeof s.family.spouse==='object'?s.family.spouse:{exists:false,name:'',income:0,age:null,source:'manual',needsConfirmation:false};
     s.family.dependents=Array.isArray(s.family.dependents)?s.family.dependents:[];

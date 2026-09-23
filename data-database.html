@@ -1,0 +1,22 @@
+<!doctype html><html lang="ja"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1"><title>読み取りデータベース</title><link rel="stylesheet" href="style.css"></head><body><header><div><a href="year-history.html" class="back">← 年度一覧</a><strong>読み取りデータベース</strong></div></header><main>
+<section class="hero compact"><div class="eyebrow">🗄️ 一度読み取った情報を保存</div><h1>年度別・読み取りデータベース</h1><p><strong>ここが読み取った情報を保存する元データベースです。</strong> 一度保存した抽出値を各年度の上限計算が参照します。再検索・再解析で別年度の計算を上書きしません。</p></section>
+<section class="card"><h2>データベースの状態</h2><div id="dbSummary">—</div></section><div id="years"></div>
+<nav><a href="index.html">ホーム</a><a href="limit-2024.html">2024上限</a><a href="limit-2025.html">2025上限</a><a href="limit-2026.html">2026上限</a><a href="year-history.html">年度別結果</a><a class="active" href="data-database.html">読み取りDB</a><a href="settings.html">設定</a></nav></main>
+<script src="data-model.js"></script><script src="calculator.js"></script><script src="integration.js"></script><script src="app.js"></script><script>document.addEventListener('DOMContentLoaded',()=>{
+const yen=n=>new Intl.NumberFormat('ja-JP').format(Math.round(Number(n)||0))+'円';
+const esc=s=>String(s??'').replace(/[&<>"']/g,m=>({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[m]));
+const ys=Object.keys(state.yearPayrollRecords||{}).map(Number).filter(y=>y>=2024&&y<=2100);for(const y of [2024,2025,2026])if(!ys.includes(y))ys.push(y);ys.sort((a,b)=>b-a);
+const allDocs=ys.flatMap(y=>(state.yearPayrollRecords?.[String(y)]?.documents||[]));
+document.getElementById('dbSummary').innerHTML=`<div class="row"><span>保存年度</span><strong>${ys.length}年</strong></div><div class="row"><span>読み取りデータ</span><strong>${allDocs.length}件</strong></div><div class="row"><span>DB方式</span><strong>一度解析 → 年度別保存 → 各年度計算が参照</strong></div><p class="note">同じDriveファイルは、ファイルID・更新日時・サイズ・解析バージョンが一致し、欠落項目がなければ再ダウンロード・再解析しません。</p>`;
+document.getElementById('years').innerHTML=ys.map(y=>{
+ const a=state.yearPayrollRecords?.[String(y)]||{salaryRecords:[],socialRecords:[],bonusRecords:[],documents:[]}; const r=state.yearRecords?.[String(y)]||{}; const w=r.withholding; const docs=a.documents||[];
+ const sal=(a.salaryRecords||[]).filter(x=>x.status==='actual').sort((p,q)=>Number(p.month)-Number(q.month)); const bon=(a.bonusRecords||[]).filter(x=>x.status==='actual'); const missing=[...new Set(docs.flatMap(d=>d.missingFields||[]))];
+ const renderObj=o=>`<pre class="db-json">${esc(JSON.stringify(o||{},null,2))}</pre>`;
+ return `<section class="card" id="year-${y}"><div class="section-head"><h2>${y}年</h2><a href="limit-${y}.html">上限計算 →</a></div><p>${w?'<span class="ok">● 源泉徴収票あり・確定</span>':'<span class="note">○ 源泉徴収票未登録</span>'}</p>
+ <h3>給与明細（読み取り済み）</h3>${sal.length?sal.map(x=>`<div class="row"><span>${x.month}月給与</span><strong>${yen(x.taxableGross??x.gross)} / 社保 ${x.social!=null?yen(x.social):'未取得'}</strong></div>`).join(''):'<p class="note">なし</p>'}
+ <h3>賞与（読み取り済み）</h3>${bon.length?bon.map(x=>`<div class="row"><span>${esc(x.season||'賞与')} ${esc(x.date||'')}</span><strong>${yen(x.amount)} / 社保 ${x.social!=null?yen(x.social):'未取得'}</strong></div>`).join(''):'<p class="note">なし</p>'}
+ <h3>この年度の全読み取りデータ</h3>${docs.length?docs.map((d,i)=>`<details><summary>${esc(d.name||d.file||d.id||`資料${i+1}`)} <small>${esc(d.type||d.detectedType||'')}</small> ${d.missingFields?.length?'<span class="warn">不足あり</span>':'<span class="ok">抽出OK</span>'}</summary><div class="db-detail"><p>年度：${esc(d.year||'—')} ${d.month?`／${esc(d.month)}月`:''} ${d.date?`／支給日 ${esc(d.date)}`:''}</p><p>解析版：${esc(d.parserVersion||'旧形式')} ／ OCR：${d.ocrUsed?'使用':'未使用'} ／ 文字数：${Number(d.textChars||0)}</p><p><b>不足項目：</b>${d.missingFields?.length?esc(d.missingFields.join('、')):'なし'}</p><h4>抽出値</h4>${renderObj(d.parsed||d)}<h4>抽出元テキスト</h4><details><summary>テキストを表示</summary><pre class="db-raw">${esc(d.rawText||'保存なし')}</pre></details></div></details>`).join(''):'<p class="note">読み取り記録なし</p>'}
+ ${missing.length?`<div class="warn"><b>この年度で未取得の項目</b><p>${missing.map(esc).join('、')}</p></div>`:'<p class="ok">この年度の保存済み資料に未取得項目はありません。</p>'}
+ <div class="miniForm"><span>娘の国民年金（${y}年）</span><strong>${yen(r.manual?.nationalPension)}</strong><a class="buttonlike" href="year-${y}.html">年度ページで入力 →</a></div></section>`;
+}).join('');
+});</script><script>if('serviceWorker' in navigator)navigator.serviceWorker.register('service-worker.js?build=20260924-database2').catch(()=>{});</script></body></html>
