@@ -3,9 +3,9 @@
 <section class="hero compact"><div class="eyebrow">📚 2024年〜</div><h1>年度ごとに保存</h1><p>検索・読み取り結果と手動入力は年度ごとに別ページへ保存します。源泉徴収票がある年は、その源泉徴収票を正（確定）として扱い、月別集計は参考照合だけを表示します。</p></section>
 <section class="card"><h2>年度を選択</h2><div id="yearLinks"></div></section>
 <section class="card"><h2>保存ルール</h2><ul><li><b>年度ごとに別ページ</b>：2024年、2025年、2026年をそれぞれ個別ページで管理します。</li><li><b>手動入力も年度別</b>：娘の国民年金など、その年に支払った控除対象額を各年度ページで個別に保存します。</li><li><b>源泉徴収票あり</b>：読み取った年間データをその年度の確定データとして固定。以後、同じ源泉徴収票を再検索・再解析しません。</li><li><b>月別集計</b>：源泉徴収票との一致確認には使いますが、差異があってもエラーにはせず、源泉徴収票を正として確定します。</li></ul></section>
-<nav><a href="index.html">ホーム</a><a href="details.html">上限詳細</a><a href="year-history.html" class="active">年度別結果</a><a href="donations.html">寄附・配送</a><a href="settings.html">設定</a><a href="import_readout.html">読み取り結果</a></nav></main>
+<nav><a href="index.html">ホーム</a><a href="limit-2024.html">2024上限</a><a href="limit-2025.html">2025上限</a><a href="limit-2026.html">2026上限</a><a href="year-history.html" class="active">年度別結果</a><a href="donations.html">寄附・配送</a><a href="settings.html">設定</a><a href="import_readout.html">読み取り結果</a></nav></main>
 <script src="data-model.js"></script><script src="calculator.js"></script><script src="integration.js"></script><script src="app.js"></script>
 <script>
 document.addEventListener('DOMContentLoaded',()=>{const box=document.getElementById('yearLinks');const first=Math.min(2024,Number(state.year)||new Date().getFullYear());const last=Math.max(2026,Number(state.year)||new Date().getFullYear());const rec=state.yearRecords||{};box.innerHTML=Array.from({length:last-first+1},(_,i)=>first+i).map(y=>{const r=rec[String(y)]||{};const status=r.withholding?'● 源泉徴収票あり・確定': '○ 手動入力・未確定';return `<a class="subcard" style="display:block;text-decoration:none;margin:10px 0" href="year-${y}.html"><h3>${y}年</h3><p class="note">${status}</p><p>年度ページを開く →</p></a>`}).join('')});
 </script>
-<script>if('serviceWorker' in navigator)navigator.serviceWorker.register('service-worker.js?build=20260923-yearpages1').catch(()=>{});</script></body></html>
+<script>if('serviceWorker' in navigator)navigator.serviceWorker.register('service-worker.js?build=20260924-limitpages1').catch(()=>{});</script></body></html>
