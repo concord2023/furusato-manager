@@ -104,25 +104,35 @@ const FurusatoCalculator = (() => {
   function historicalCalc(record,manual={}){
     const w=record?.withholding||record||{}; const year=Number(record?.year||w.year||0);
     const nationalPension=Math.max(0,Number(manual?.nationalPension)||0);
-    const salaryIncome=Math.max(0,Number(w.salaryIncomeAfterDeduction)||0);
-    const deductions=Math.max(0,Number(w.deductionsTotal)||0);
-    if(!year||!salaryIncome||!deductions)return {year,status:'review',estimatedLimit:0,safe:0,nationalPension,reason:'源泉徴収票の必要項目が不足しています。'};
-    // The withholding certificate already contains the year's actual salary-income
-    // calculation and total income deductions, so do not run the 2026 forecast
-    // salary-deduction rules again. Manual daughter National Pension is added to
-    // social-insurance deductions for this year's result.
+    const salaryIncomeBase=Math.max(0,Number(w.salaryIncomeAfterDeduction)||0);
+    let salaryIncome=salaryIncomeBase;
+    const temporaryTaxable=manual?.temporaryTaxable!==false?Math.max(0,Number(manual?.temporary)||0):0;
+    salaryIncome+=temporaryTaxable+Math.max(0,Number(manual?.otherIncome)||0);
+    let deductions=Math.max(0,Number(w.deductionsTotal)||0);
+    const hasManualLife=manual?.lifeInsuranceOverride===true || (manual?.lifeInsurance&&typeof manual.lifeInsurance==='object'&&Object.values(manual.lifeInsurance).some(v=>Number(v)>0));
+    const hasManualEq=manual?.earthquakeOverride===true || (manual?.earthquakeDetail&&typeof manual.earthquakeDetail==='object'&&Object.values(manual.earthquakeDetail).some(v=>Number(v)>0));
+    const manualLife=hasManualLife?(()=>{
+      const d={deductions:{lifeInsurance:manual.lifeInsurance},family:{dependents:[]}};
+      return calcLifeInsurance(d).total;
+    })():Math.max(0,Number(w.lifeInsuranceDeduction)||0);
+    const manualEq=hasManualEq?earthquakeDeduction(manual.earthquakeDetail):Math.max(0,Number(w.earthquakeInsuranceDeduction)||0);
+    const parsedLife=Math.max(0,Number(w.lifeInsuranceDeduction)||0);
+    const parsedEq=Math.max(0,Number(w.earthquakeInsuranceDeduction)||0);
+    const parsedSpecial=Math.max(0,Number(w.specialDependent)||0);
+    const parsedIdeco=Math.max(0,Number(w.ideco||w.smallBusinessDeduction)||0);
+    if(hasManualLife)deductions=Math.max(0,deductions-parsedLife+manualLife);
+    if(hasManualEq)deductions=Math.max(0,deductions-parsedEq+manualEq);
+    if(manual?.ideco!=null)deductions=Math.max(0,deductions-parsedIdeco+Math.max(0,Number(manual.ideco)||0));
+    if(manual?.specialDependent!=null)deductions=Math.max(0,deductions-parsedSpecial+Math.max(0,Number(manual.specialDependent)||0));
+    if(!year||!salaryIncomeBase||!deductions)return {year,status:'review',estimatedLimit:0,safe:0,nationalPension,ideco:Number(manual?.ideco)||parsedIdeco,lifeInsuranceDeduction:manualLife,earthquakeInsuranceDeduction:manualEq,reason:'源泉徴収票の必要項目が不足しています。'};
     const taxableIncome=Math.max(0,Math.floor((salaryIncome-deductions-nationalPension)/1000)*1000);
     const basicIncome=Math.max(0,Number(w.basicDeduction)||0);
     const residentBasic=430000;
-    const lifeIncome=Math.max(0,Number(w.lifeInsuranceDeduction)||0);
-    // Resident-tax life insurance deduction cannot be reconstructed perfectly from
-    // the withholding certificate's deduction-only field. Use the known 2026-style
-    // resident cap as a transparent adjustment; historical results remain tied to
-    // the actual withholding certificate and are not re-imported as forecasts.
-    const lifeResident=Math.min(70000,lifeIncome);
-    const earthquakeIncome=Math.max(0,Number(w.earthquakeInsuranceDeduction)||0);
-    const earthquakeResident=Math.min(25000,Math.floor(earthquakeIncome/2));
-    const specialIncome=Math.max(0,Number(w.specialDependent)||0);
+    const lifeIncome=manualLife;
+    const lifeResident=hasManualLife?calcLifeInsuranceResident({deductions:{lifeInsurance:manual.lifeInsurance}}):Math.min(70000,lifeIncome);
+    const earthquakeIncome=manualEq;
+    const earthquakeResident=hasManualEq?earthquakeResidentDeduction(manual.earthquakeDetail):Math.min(25000,Math.floor(earthquakeIncome/2));
+    const specialIncome=Math.max(0,manual?.specialDependent!=null?Number(manual.specialDependent):Number(w.specialDependent)||0);
     const specialResident=(year>=2025&&specialIncome>=60000)?Math.min(450000,specialIncome):specialIncome;
     const residentTaxable=Math.max(0,Math.floor((taxableIncome+(basicIncome-residentBasic)+(lifeIncome-lifeResident)+(earthquakeIncome-earthquakeResident)+(specialIncome-specialResident))/1000)*1000);
     const residentLevy=residentTaxable*.10;
@@ -131,7 +141,7 @@ const FurusatoCalculator = (() => {
     const denom=Math.max(.01,.90-rate*1.021);
     const estimatedLimit=Math.max(2000,Math.floor((specialLimit/denom+2000)/1000)*1000);
     const safe=Math.max(2000,Math.floor(estimatedLimit*.90/1000)*1000);
-    return {year,status:'confirmed',source:'withholding',nationalPension,taxableIncome,residentTaxable,residentLevy,rate,estimatedLimit,safe,annualSalary:Number(w.annualSalary)||0,salaryIncomeAfterDeduction:salaryIncome,deductionsTotal:deductions,withholdingSocial:Number(w.social)||0,lifeInsuranceDeduction:lifeIncome,earthquakeInsuranceDeduction:earthquakeIncome,specialDependent:specialIncome,manualSocialTotal:nationalPension};
+    return {year,status:'confirmed',source:'withholding',nationalPension,taxableIncome,residentTaxable,residentLevy,rate,estimatedLimit,safe,annualSalary:Number(w.annualSalary)||0,salaryIncomeAfterDeduction:salaryIncome,deductionsTotal:deductions,withholdingSocial:Number(w.social)||0,lifeInsuranceDeduction:lifeIncome,earthquakeInsuranceDeduction:earthquakeIncome,specialDependent:specialIncome,ideco:Math.max(0,Number(manual?.ideco!=null?manual.ideco:parsedIdeco)||0),temporary:temporaryTaxable,manualSocialTotal:nationalPension};
   }
   function sensitivity(s,deltaSalary=100000,deltaBonus=0){const a=calc(s);const b=FurusatoModel.clone(s);b.forecastSalary=[...(b.forecastSalary||[])];if(b.forecastSalary.length)b.forecastSalary[b.forecastSalary.length-1]=(b.forecastSalary.at(-1)||0)+deltaSalary;else b.forecastSalary=[deltaSalary];b.forecastBonus=(Number(b.forecastBonus)||0)+deltaBonus;const c=calc(b);return {base:a,changed:c,limitDelta:c.estimatedLimit-a.estimatedLimit};}
   return {calc,salaryDeduction,basicDeduction2026,incomeTaxRate,historicalCalc,sensitivity,calcLifeInsurance,earthquakeDeduction,dependentDeductions,spouseDeductions};

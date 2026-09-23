@@ -1,7 +1,7 @@
 // Data model and normalization for the ふるさと納税マネージャー.
 const FurusatoModel = (() => {
   const DEFAULT = {
-    schemaVersion: 14, year: new Date().getFullYear(), asOf: new Date().toISOString().slice(0,10), actualThrough: 0, importSettings:{targetYear:new Date().getFullYear(),priorYear:new Date().getFullYear()-1}, importHistory:[],
+    schemaVersion: 15, year: new Date().getFullYear(), asOf: new Date().toISOString().slice(0,10), actualThrough: 0, importSettings:{targetYear:new Date().getFullYear(),priorYear:new Date().getFullYear()-1}, importHistory:[],
     salaryRecords: [],
     yearRecords: {},
     yearPayrollRecords: {},
@@ -49,7 +49,7 @@ const FurusatoModel = (() => {
       s.bonusSocialRecords=clone(DEFAULT.bonusSocialRecords);
     }
     if(Number(raw?.schemaVersion||0)<11){s.deductions=s.deductions||{};s.deductions.incomeAdjustmentOverride=null;s.deductions.specialDependentOverride=null;}
-    s.schemaVersion=14;
+    s.schemaVersion=15;
     s.importSettings=s.importSettings||{targetYear:s.year||2026,priorYear:(s.year||2026)-1};
     s.importSettings.targetYear=Number(s.importSettings.targetYear)||Number(s.year)||2026;
     s.importSettings.priorYear=s.importSettings.targetYear-1;
@@ -133,7 +133,13 @@ const FurusatoModel = (() => {
     }
     for(const [k,v] of Object.entries(s.yearRecords)){
       const y=Number(k); if(!y||y<2024||y>2100||!v||typeof v!=='object')delete s.yearRecords[k];
-      else {v.year=y;v.manual=v.manual&&typeof v.manual==='object'?v.manual:{};v.manual.nationalPension=Math.max(0,Number(v.manual.nationalPension)||0);}
+      else {
+        v.year=y; v.manual=v.manual&&typeof v.manual==='object'?v.manual:{};
+        v.manual.nationalPension=Math.max(0,Number(v.manual.nationalPension)||0);
+        if(v.manual.lifeInsurance&&typeof v.manual.lifeInsurance==='object')v.manual.lifeInsurance={newGeneral:Number(v.manual.lifeInsurance.newGeneral)||0,oldGeneral:Number(v.manual.lifeInsurance.oldGeneral)||0,nursingMedical:Number(v.manual.lifeInsurance.nursingMedical)||0,newPension:Number(v.manual.lifeInsurance.newPension)||0,oldPension:Number(v.manual.lifeInsurance.oldPension)||0};
+        if(v.manual.earthquakeDetail&&typeof v.manual.earthquakeDetail==='object')v.manual.earthquakeDetail={paid:Number(v.manual.earthquakeDetail.paid)||0,oldLongTerm:Number(v.manual.earthquakeDetail.oldLongTerm)||0};
+        v.manual.ideco=Math.max(0,Number(v.manual.ideco)||0); v.manual.temporary=Math.max(0,Number(v.manual.temporary)||0); v.manual.temporaryTaxable=v.manual.temporaryTaxable!==false; v.manual.lifeInsuranceOverride=v.manual.lifeInsuranceOverride===true || !!(v.manual.lifeInsurance&&Object.values(v.manual.lifeInsurance).some(n=>Number(n)>0)); v.manual.earthquakeOverride=v.manual.earthquakeOverride===true || !!(v.manual.earthquakeDetail&&Object.values(v.manual.earthquakeDetail).some(n=>Number(n)>0));
+      }
     }
     // Permanent year archive: every imported payroll document is kept under its own calendar year.
     // This is deliberately separate from the live target-year forecast so changing the Drive
