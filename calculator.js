@@ -60,6 +60,7 @@ const FurusatoCalculator = (() => {
   }
 
   function calc(s){
+    const year=Number(s.year||new Date().getFullYear());
     const salaryActual=sum((s.salaryRecords||[]).filter(r=>r.status==='actual').map(r=>({gross:r.taxableGross??r.gross}))); 
     const salaryForecast=sum((s.salaryRecords||[]).filter(r=>r.status==='forecast').map(r=>({gross:r.taxableGross??r.gross}))) || sum(s.forecastSalary||[]);
     const explicitForecast=sum(s.forecastSalary||[]);
@@ -72,7 +73,7 @@ const FurusatoCalculator = (() => {
     const incomeAdjustmentAuto=(employmentGross>8500000 && ((s.family?.dependents||[]).some(d=>Number(d.age)>=0&&Number(d.age)<23)||s.family?.selfSpecialDisability||s.family?.spouseSpecialDisability))?Math.ceil((Math.min(employmentGross,10000000)-8500000)*.1):0;
     const incomeAdjustmentDeduction=Math.max(incomeAdjustmentOverride,incomeAdjustmentAuto);
     const totalIncomeBeforeDed=Math.max(0,employmentGross-salaryDeduction(employmentGross)-incomeAdjustmentDeduction+tempTaxable+Number(s.adjustments?.otherIncome||0));
-    const socialSalaryActual=sum(s.socialRecords?.filter(r=>r.status==='actual')); const socialSalaryForecast=sum(s.socialRecords?.filter(r=>r.status==='forecast'))+sum(s.forecastSocial||[]); const bonusSocialActual=sum(s.bonusSocialRecords?.filter(r=>r.status==='actual')); const bonusSocialForecast=sum(s.bonusSocialRecords?.filter(r=>r.status==='forecast')); const socialActual=socialSalaryActual+bonusSocialActual; const socialForecast=socialSalaryForecast+bonusSocialForecast; const social=socialActual+socialForecast;
+    const socialSalaryActual=sum(s.socialRecords?.filter(r=>r.status==='actual')); const socialSalaryForecast=sum(s.socialRecords?.filter(r=>r.status==='forecast'))+sum(s.forecastSocial||[]); const bonusSocialActual=sum(s.bonusSocialRecords?.filter(r=>r.status==='actual')); const bonusSocialForecast=sum(s.bonusSocialRecords?.filter(r=>r.status==='forecast')); const yearRecord=s.yearRecords?.[String(year)]||{}; const nationalPension=Math.max(0,Number(yearRecord.manual?.nationalPension)||0); const socialActual=socialSalaryActual+bonusSocialActual+nationalPension; const socialForecast=socialSalaryForecast+bonusSocialForecast; const social=socialActual+socialForecast;
     const basic=s.deductions?.basicOverride==null?basicDeduction2026(totalIncomeBeforeDed):Number(s.deductions.basicOverride)||0; const life=calcLifeInsurance(s), lifeResident=calcLifeInsuranceResident(s);
     const earthquakeDetail=s.deductions?.earthquakeDetail||{paid:Number(s.deductions?.earthquake)||0,oldLongTerm:0};
     const earthquake=earthquakeDeduction(earthquakeDetail), earthquakeResident=earthquakeResidentDeduction(earthquakeDetail);
@@ -93,10 +94,42 @@ const FurusatoCalculator = (() => {
     const estimatedLimit=Math.max(2000,Math.floor((specialLimit/denom+2000)/1000)*1000);
     const safe=Math.max(2000,Math.floor(estimatedLimit*.90/1000)*1000);
     const donated=(s.donations||[]).filter(x=>x.status!=='確認待ち'&&x.included!==false).reduce((a,x)=>a+(Number(x.amount)||0),0);
-    const pendingDonations=(s.donations||[]).filter(x=>x.status==='確認待ち'&&x.included!==false).reduce((a,x)=>a+(Number(x.amount)||0),0); const unknownInputs=[]; if(!s.deductions?.ideco) unknownInputs.push('iDeCo'); if(!(life.total||0)) unknownInputs.push('生命保険料控除'); if(!(earthquake||0)) unknownInputs.push('地震保険料控除'); if(!otherTotal) unknownInputs.push('その他所得控除'); if(dep.under23 && !incomeAdjustmentDeduction) unknownInputs.push('所得金額調整控除'); return {salaryActual,salaryForecast:salaryForecastTotal,bonusActual,bonusForecast,adjustmentTotal,employmentGross,tempTaxable,totalIncomeBeforeDed,incomeAdjustmentDeduction,basic,residentBasic,socialSalaryActual,socialSalaryForecast,bonusSocialActual,bonusSocialForecast,socialActual,socialForecast,social,basic,ideco,lifeInsurance:life.total,lifeInsuranceBreakdown:life,lifeResident,earthquake,earthquakeResident,other:otherTotal,otherBreakdown,dependentDeduction:dep.income,residentDependentDeduction:dep.resident,specialDependent:dep.specialDependent,specialDependentResident:specialResident,spouseDeduction:spouse.income,residentSpouseDeduction:spouse.resident,taxableIncome,residentTaxable,residentLevy,rate,incomeTaxBase,incomeTaxAnnual,specialLimit,estimatedLimit,safe,donated,pendingDonations,remaining:Math.max(0,estimatedLimit-donated),unknownInputs};
+    const pendingDonations=(s.donations||[]).filter(x=>x.status==='確認待ち'&&x.included!==false).reduce((a,x)=>a+(Number(x.amount)||0),0); const unknownInputs=[]; if(!s.deductions?.ideco) unknownInputs.push('iDeCo'); if(!(life.total||0)) unknownInputs.push('生命保険料控除'); if(!(earthquake||0)) unknownInputs.push('地震保険料控除'); if(!otherTotal) unknownInputs.push('その他所得控除'); if(dep.under23 && !incomeAdjustmentDeduction) unknownInputs.push('所得金額調整控除'); return {salaryActual,salaryForecast:salaryForecastTotal,bonusActual,bonusForecast,adjustmentTotal,employmentGross,tempTaxable,totalIncomeBeforeDed,incomeAdjustmentDeduction,basic,residentBasic,socialSalaryActual,socialSalaryForecast,bonusSocialActual,bonusSocialForecast,nationalPension,socialActual,socialForecast,social,basic,ideco,lifeInsurance:life.total,lifeInsuranceBreakdown:life,lifeResident,earthquake,earthquakeResident,other:otherTotal,otherBreakdown,dependentDeduction:dep.income,residentDependentDeduction:dep.resident,specialDependent:dep.specialDependent,specialDependentResident:specialResident,spouseDeduction:spouse.income,residentSpouseDeduction:spouse.resident,taxableIncome,residentTaxable,residentLevy,rate,incomeTaxBase,incomeTaxAnnual,specialLimit,estimatedLimit,safe,donated,pendingDonations,remaining:Math.max(0,estimatedLimit-donated),unknownInputs};
+  }
+  function historicalCalc(record,manual={}){
+    const w=record?.withholding||record||{}; const year=Number(record?.year||w.year||0);
+    const nationalPension=Math.max(0,Number(manual?.nationalPension)||0);
+    const salaryIncome=Math.max(0,Number(w.salaryIncomeAfterDeduction)||0);
+    const deductions=Math.max(0,Number(w.deductionsTotal)||0);
+    if(!year||!salaryIncome||!deductions)return {year,status:'review',estimatedLimit:0,safe:0,nationalPension,reason:'源泉徴収票の必要項目が不足しています。'};
+    // The withholding certificate already contains the year's actual salary-income
+    // calculation and total income deductions, so do not run the 2026 forecast
+    // salary-deduction rules again. Manual daughter National Pension is added to
+    // social-insurance deductions for this year's result.
+    const taxableIncome=Math.max(0,Math.floor((salaryIncome-deductions-nationalPension)/1000)*1000);
+    const basicIncome=Math.max(0,Number(w.basicDeduction)||0);
+    const residentBasic=430000;
+    const lifeIncome=Math.max(0,Number(w.lifeInsuranceDeduction)||0);
+    // Resident-tax life insurance deduction cannot be reconstructed perfectly from
+    // the withholding certificate's deduction-only field. Use the known 2026-style
+    // resident cap as a transparent adjustment; historical results remain tied to
+    // the actual withholding certificate and are not re-imported as forecasts.
+    const lifeResident=Math.min(70000,lifeIncome);
+    const earthquakeIncome=Math.max(0,Number(w.earthquakeInsuranceDeduction)||0);
+    const earthquakeResident=Math.min(25000,Math.floor(earthquakeIncome/2));
+    const specialIncome=Math.max(0,Number(w.specialDependent)||0);
+    const specialResident=(year>=2025&&specialIncome>=60000)?Math.min(450000,specialIncome):specialIncome;
+    const residentTaxable=Math.max(0,Math.floor((taxableIncome+(basicIncome-residentBasic)+(lifeIncome-lifeResident)+(earthquakeIncome-earthquakeResident)+(specialIncome-specialResident))/1000)*1000);
+    const residentLevy=residentTaxable*.10;
+    const rate=incomeTaxRate(taxableIncome);
+    const specialLimit=residentLevy*.20;
+    const denom=Math.max(.01,.90-rate*1.021);
+    const estimatedLimit=Math.max(2000,Math.floor((specialLimit/denom+2000)/1000)*1000);
+    const safe=Math.max(2000,Math.floor(estimatedLimit*.90/1000)*1000);
+    return {year,status:'confirmed',source:'withholding',nationalPension,taxableIncome,residentTaxable,residentLevy,rate,estimatedLimit,safe,annualSalary:Number(w.annualSalary)||0,salaryIncomeAfterDeduction:salaryIncome,deductionsTotal:deductions,withholdingSocial:Number(w.social)||0,lifeInsuranceDeduction:lifeIncome,earthquakeInsuranceDeduction:earthquakeIncome,specialDependent:specialIncome,manualSocialTotal:nationalPension};
   }
   function sensitivity(s,deltaSalary=100000,deltaBonus=0){const a=calc(s);const b=FurusatoModel.clone(s);b.forecastSalary=[...(b.forecastSalary||[])];if(b.forecastSalary.length)b.forecastSalary[b.forecastSalary.length-1]=(b.forecastSalary.at(-1)||0)+deltaSalary;else b.forecastSalary=[deltaSalary];b.forecastBonus=(Number(b.forecastBonus)||0)+deltaBonus;const c=calc(b);return {base:a,changed:c,limitDelta:c.estimatedLimit-a.estimatedLimit};}
-  return {calc,salaryDeduction,basicDeduction2026,incomeTaxRate,sensitivity,calcLifeInsurance,earthquakeDeduction,dependentDeductions,spouseDeductions};
+  return {calc,salaryDeduction,basicDeduction2026,incomeTaxRate,historicalCalc,sensitivity,calcLifeInsurance,earthquakeDeduction,dependentDeductions,spouseDeductions};
 })();
 if(typeof window!=='undefined') window.FurusatoCalculator=FurusatoCalculator;
 if(typeof module!=='undefined') module.exports=FurusatoCalculator;

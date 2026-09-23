@@ -255,6 +255,18 @@ const FurusatoGoogleDrive = (() => {
     await putCachedParsed(f,pdf,x,type);
     return {pdf,x,type,cacheHit:false};
   }
+  function saveWithholdingYearRecord(state,w){
+    const y=Number(w?.year);
+    // The withholding certificate is the authoritative annual result. A mismatch
+    // between monthly payroll aggregation and the certificate is only a reference
+    // note; it must never turn an otherwise readable withholding year into
+    // 'review needed'. Only missing core certificate fields block confirmation.
+    const corePresent=!!(y&&y>=2024&&Number(w?.annualSalary)>0&&Number(w?.salaryIncomeAfterDeduction)>0&&Number(w?.deductionsTotal)>=0&&Number(w?.incomeTax)>=0&&Number(w?.social)>=0);
+    if(!corePresent)return;
+    state.yearRecords=state.yearRecords&&typeof state.yearRecords==='object'&&!Array.isArray(state.yearRecords)?state.yearRecords:{};
+    const prev=state.yearRecords[String(y)]||{};
+    state.yearRecords[String(y)]={...prev,year:y,status:'confirmed',withholding:{...w,needsReview:false,certificateAuthoritative:true},manual:{...(prev.manual||{}),nationalPension:Math.max(0,Number(prev.manual?.nationalPension)||0)},reconciliation:prev.reconciliation||null,updatedAt:new Date().toISOString()};
+  }
   function neededCandidates(files,state,targetYear,priorYear){
     const currentBonus=state.bonusRecords||[];
     const hasCurrentSeason=s=>currentBonus.some(x=>Number(x.amount)>0&&bonusSeason(Number(String(x.date||'').slice(5,7))||Number(x.month))===s);
@@ -262,9 +274,9 @@ const FurusatoGoogleDrive = (() => {
     const hasPriorSeason=s=>priorBonus.some(x=>bonusSeason(Number(String(x.date||'').slice(5,7))||Number(x.month))===s&&Number(x.amount)>0);
     const candidates=files.filter(f=>{
       const y=Number(f.filenameYear);
-      if(y===targetYear)return true;
+      if(y===targetYear)return f.candidateType!=='withholding' || !state.withholdingRecords?.some(r=>Number(r.year)===targetYear&&Number(r.annualSalary)>0&&!r.needsReview);
       if(y!==priorYear)return false;
-      if(f.candidateType==='withholding')return true;
+      if(f.candidateType==='withholding')return !state.withholdingRecords?.some(r=>Number(r.year)===priorYear&&Number(r.annualSalary)>0&&!r.needsReview);
       if(f.candidateType==='bonus'){
         const m=Number(String(f.name||'').match(/-(\d{6,8})\b/)?.[1]?.slice(4,6)||0);
         const s=bonusSeason(m);
@@ -1285,7 +1297,11 @@ const FurusatoGoogleDrive = (() => {
     const fieldsPresent=required.every(Number.isFinite);
     const relationsOk=fieldsPresent&&annualSalary>salaryIncomeAfterDeduction&&salaryIncomeAfterDeduction>0&&deductionsTotal>=social&&incomeTax>=0&&incomeTax<=annualSalary;
     const arithmeticOk=fieldsPresent&&relationsOk;
-    return {year,annualSalary,salaryIncomeAfterDeduction,deductionsTotal,social,incomeTax,lifeInsuranceDeduction,earthquakeInsuranceDeduction,oldLongTermDamageInsurance,housingLoanDeduction,specialDependent,basicDeduction,incomeAdjustment,newLifeInsurance,oldLifeInsurance,nursingInsurance,newPension,oldPension,spousePresent,dependentAgeList,dependentCountEvidence,sixteenCountEvidence,document:name,source:'google-drive',status:'actual',arithmeticOk,needsReview:!arithmeticOk};
+    // A certificate is the authoritative annual source. Internal arithmetic
+    // anomalies are retained as a diagnostic flag, but are not treated as an
+    // import error when all core annual fields were actually read.
+    const needsReview=!fieldsPresent;
+    return {year,annualSalary,salaryIncomeAfterDeduction,deductionsTotal,social,incomeTax,lifeInsuranceDeduction,earthquakeInsuranceDeduction,oldLongTermDamageInsurance,housingLoanDeduction,specialDependent,basicDeduction,incomeAdjustment,newLifeInsurance,oldLifeInsurance,nursingInsurance,newPension,oldPension,spousePresent,dependentAgeList,dependentCountEvidence,sixteenCountEvidence,document:name,source:'google-drive',status:'actual',arithmeticOk,certificateAuthoritative:fieldsPresent,needsReview};
   }
   function uniquePush(arr,item,key){const k=key(item);if(!arr.some(x=>key(x)===k))arr.push(item);}
   function recordHistory(state,item){
@@ -1401,10 +1417,24 @@ const FurusatoGoogleDrive = (() => {
           if(!upsertBonusRecord(state,x,f,targetYear,result) && Number(x.year)===Number(priorYear) && x.date&&x.amount&&x.season){state.priorBonusRecords=state.priorBonusRecords||[];const season=x.season||bonusSeason(x.month);state.priorBonusRecords=state.priorBonusRecords.filter(v=>!(Number(v.year)===Number(priorYear)&&(v.season||bonusSeason(v.month))===season));state.priorBonusRecords.push({year:priorYear,date:x.date,month:x.month,season,amount:x.amount,social:x.social,socialComponents:x.socialComponents||{},standardBonusHealth:x.standardBonusHealth,standardBonusPension:x.standardBonusPension,source:'prior',status:'prior',document:f.name,driveFileId:f.id});result.added++;recordHistory(state,{at:new Date().toISOString(),name:f.name,type:'bonus',year:x.year||f.filenameYear||null,month:x.month||null,date:x.date||null,status:'取り込み済み',amount:x.amount||null,social:x.social||null,needsReview:false});}else if(!(x.date&&x.amount&&x.season)){result.review++;state.importHistory.unshift({at:new Date().toISOString(),name:f.name,type:'bonus',year:x.year||f.filenameYear||null,status:'確認待ち',amount:x.amount||null,social:x.social||null,needsReview:true,reason:x.date&&x.amount&&!x.season?'賞与月が夏（5〜9月）/冬（10〜2月）のどちらにも判定できませんでした':'賞与額または年月を取得できませんでした'});}
         }else if(type==='withholding'){
           Object.assign(detail,{year:x.year||null,annualSalary:x.annualSalary||0,salaryIncomeAfterDeduction:x.salaryIncomeAfterDeduction||0,deductionsTotal:x.deductionsTotal||0,social:x.social||0,incomeTax:x.incomeTax||0,lifeInsuranceDeduction:x.lifeInsuranceDeduction||0,earthquakeInsuranceDeduction:x.earthquakeInsuranceDeduction||0,oldLongTermDamageInsurance:x.oldLongTermDamageInsurance||0,housingLoanDeduction:x.housingLoanDeduction||0,specialDependent:x.specialDependent||0,basicDeduction:x.basicDeduction||0,incomeAdjustment:x.incomeAdjustment||0,newLifeInsurance:x.newLifeInsurance||0,oldLifeInsurance:x.oldLifeInsurance||0,nursingInsurance:x.nursingInsurance||0,newPension:x.newPension||0,oldPension:x.oldPension||0,spousePresent:!!x.spousePresent,dependentAgeList:x.dependentAgeList||[],needsReview:!!x.needsReview}); if(x.year&&![targetYear,priorYear].includes(Number(x.year))){result.skipped++;continue}
-          state.sourceDocuments=state.sourceDocuments||[];const old=state.sourceDocuments.find(d=>d.file===f.name);const doc={file:f.name,type,status:x.needsReview?'review_needed':'imported',source:'google-drive',driveFileId:f.id,note:`源泉徴収票を取得。${x.year===priorYear?'前年参考値として保持':'対象年の参考資料として保持'}。`,year:x.year||null,annualSalary:x.annualSalary||0,salaryIncomeAfterDeduction:x.salaryIncomeAfterDeduction||0,deductionsTotal:x.deductionsTotal||0,social:x.social||0,incomeTax:x.incomeTax||0,lifeInsuranceDeduction:x.lifeInsuranceDeduction||0,earthquakeInsuranceDeduction:x.earthquakeInsuranceDeduction||0,oldLongTermDamageInsurance:x.oldLongTermDamageInsurance||0,housingLoanDeduction:x.housingLoanDeduction||0,specialDependent:x.specialDependent||0,basicDeduction:x.basicDeduction||0,incomeAdjustment:x.incomeAdjustment||0,newLifeInsurance:x.newLifeInsurance||0,oldLifeInsurance:x.oldLifeInsurance||0,nursingInsurance:x.nursingInsurance||0,newPension:x.newPension||0,oldPension:x.oldPension||0,spousePresent:!!x.spousePresent,dependentAgeList:x.dependentAgeList||[],arithmeticOk:!!x.arithmeticOk,needsReview:!!x.needsReview};if(old)Object.assign(old,doc);else state.sourceDocuments.push(doc);
           state.withholdingRecords=Array.isArray(state.withholdingRecords)?state.withholdingRecords:[];
-          const wr={...x,source:'google-drive',status:'actual',document:f.name,driveFileId:f.id};
-          const wi=state.withholdingRecords.findIndex(r=>r.document===f.name||r.driveFileId===f.id); if(wi>=0)state.withholdingRecords[wi]={...state.withholdingRecords[wi],...wr}; else state.withholdingRecords.push(wr);
+          const wr={...x,source:'google-drive',status:'actual',document:f.name,driveFileId:f.id,certificateAuthoritative:!x.needsReview};
+          // Compare only as a reference. Monthly payroll can legitimately differ
+          // from the annual withholding certificate because of timing, taxable/non-
+          // taxable treatment, bonuses, year-end adjustment, or missing months.
+          // Never downgrade the certificate because of this comparison.
+          const monthlyRows=(state.salaryRecords||[]).filter(r=>Number(r.year)===Number(x.year)&&r.status==='actual');
+          const monthlyGross=monthlyRows.reduce((a,r)=>a+(Number(r.grossTotal??r.taxableGross)||0),0);
+          const bonusRows=(state.bonusRecords||[]).filter(r=>Number(r.year)===Number(x.year)&&r.status==='actual');
+          const bonusGross=bonusRows.reduce((a,r)=>a+(Number(r.amount)||0),0);
+          const referenceGross=monthlyGross+bonusGross;
+          const monthlySocial=(state.socialRecords||[]).filter(r=>Number(r.year)===Number(x.year)&&r.status==='actual').reduce((a,r)=>a+(Number(r.amount)||0),0);
+          const bonusSocial=bonusRows.reduce((a,r)=>a+(Number(r.social)||0),0);
+          const referenceSocial=monthlySocial+bonusSocial;
+          wr.monthlyReference={months:monthlyRows.map(r=>Number(r.month)).filter(Boolean).sort((a,b)=>a-b),monthlyGross,bonusGross,referenceGross,annualSalary:Number(x.annualSalary)||0,difference:referenceGross-(Number(x.annualSalary)||0),monthlySocial,bonusSocial,referenceSocial,withholdingSocial:Number(x.social)||0,socialDifference:referenceSocial-(Number(x.social)||0),complete:monthlyRows.length===12,comparison:'参考情報のみ'};
+          state.sourceDocuments=state.sourceDocuments||[];const old=state.sourceDocuments.find(d=>d.file===f.name);const doc={file:f.name,type,status:x.needsReview?'review_needed':'imported',source:'google-drive',driveFileId:f.id,note:`源泉徴収票を取得。${x.year===priorYear?'前年参考値として保持':'対象年の参考資料として保持'}。`,year:x.year||null,annualSalary:x.annualSalary||0,salaryIncomeAfterDeduction:x.salaryIncomeAfterDeduction||0,deductionsTotal:x.deductionsTotal||0,social:x.social||0,incomeTax:x.incomeTax||0,lifeInsuranceDeduction:x.lifeInsuranceDeduction||0,earthquakeInsuranceDeduction:x.earthquakeInsuranceDeduction||0,oldLongTermDamageInsurance:x.oldLongTermDamageInsurance||0,housingLoanDeduction:x.housingLoanDeduction||0,specialDependent:x.specialDependent||0,basicDeduction:x.basicDeduction||0,incomeAdjustment:x.incomeAdjustment||0,newLifeInsurance:x.newLifeInsurance||0,oldLifeInsurance:x.oldLifeInsurance||0,nursingInsurance:x.nursingInsurance||0,newPension:x.newPension||0,oldPension:x.oldPension||0,spousePresent:!!x.spousePresent,dependentAgeList:x.dependentAgeList||[],arithmeticOk:!!x.arithmeticOk,needsReview:false,certificateAuthoritative:!x.needsReview,monthlyReference:wr.monthlyReference||null};if(old)Object.assign(old,doc);else state.sourceDocuments.push(doc);
+          const wi=state.withholdingRecords.findIndex(r=>r.document===f.name||r.driveFileId===f.id||Number(r.year)===Number(x.year)); if(wi>=0)state.withholdingRecords[wi]={...state.withholdingRecords[wi],...wr}; else state.withholdingRecords.push(wr);
+          saveWithholdingYearRecord(state,wr);
           if(x.year===priorYear){
             state.prior=state.prior||{salary:0,bonus:0,social:0};if(x.annualSalary)state.prior.salary=x.annualSalary;if(x.social)state.prior.social=x.social;
             state.priorWithholding={...wr,source:'prior-withholding'};
