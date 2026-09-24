@@ -299,7 +299,7 @@ const FurusatoGoogleDrive = (() => {
       }
     }
     return {
-      version:'20260924-readout2',
+      version:'20260925-readout3',
       document:String(name||''),
       pdfText,
       ocrText,
@@ -716,16 +716,48 @@ const FurusatoGoogleDrive = (() => {
     if(explicitTaxable==null && grossTotal!=null && nonTaxableTotal!=null)explicitTaxable=grossTotal-nonTaxableTotal;
     const derivedTaxable=(grossTotal!=null&&nonTaxableTotal!=null&&grossTotal>=nonTaxableTotal)?grossTotal-nonTaxableTotal:null;
     const taxableBase=derivedTaxable!=null?derivedTaxable:(explicitTaxable!=null?explicitTaxable:null);
+    // Toyota's PDF text layer sometimes drops the closing parenthesis in
+    // labels such as "健康保険料（基本）" -> "健康保険料（基本".
+    // Do not let that formatting loss invalidate the entire social-insurance
+    // row: the amount is on the same visual/text line and can be recovered
+    // safely by a punctuation-tolerant, same-line matcher.
     const socialLabels={
       employmentInsurance:['雇用保険料'],
-      healthInsurance:['健康保険料（基本）','健康保険料 (基本)'],
-      healthInsuranceSpecial:['健康保険料（特定）','健康保険料 (特定)'],
+      healthInsurance:['健康保険料（基本）','健康保険料 (基本)','健康保険料（基本'],
+      healthInsuranceSpecial:['健康保険料（特定）','健康保険料 (特定)','健康保険料（特定'],
       nursingCare:['介護保険料'],
       childSupport:['子ども・子育て支援金','子ども 子育て支援金','子ども子育て支援金'],
       pension:['年金保険料','厚生年金保険料']
     };
+    const flexibleSameLineAmount=(source,labels)=>{
+      const raw=typeof source==='string'?source:String(source?.text||'');
+      const compact=v=>String(v||'').replace(/[\s\u3000()（）「」［］【】・･:：]/g,'').toLowerCase();
+      const lines=raw.replace(/\r/g,'').split(/\n+/);
+      for(const line of lines){
+        const lc=compact(line); if(!lc)continue;
+        for(const label of labels||[]){
+          const l=compact(label); if(!l)continue;
+          const idx=lc.indexOf(l); if(idx<0)continue;
+          // Map the compacted label end back to the raw line. This preserves
+          // thousands separators and avoids accidentally taking the next row.
+          let rp=0,cp=0;
+          while(rp<line.length && cp<idx+l.length){
+            const ch=line[rp++];
+            if(/[\s\u3000()（）「」［］【】・･:：]/.test(ch))continue;
+            cp++;
+          }
+          const after=line.slice(rp);
+          const vals=extractNumericTokens(after).map(x=>x.n).filter(n=>n<1900||n>2100);
+          if(vals.length)return vals[0];
+        }
+      }
+      return null;
+    };
     const socialComponents={};
-    for(const [k,labels] of Object.entries(socialLabels)) socialComponents[k]=extractExactYenAfterLabel(text,labels);
+    for(const [k,labels] of Object.entries(socialLabels)){
+      socialComponents[k]=extractExactYenAfterLabel(text,labels);
+      if(!Number.isFinite(socialComponents[k]))socialComponents[k]=flexibleSameLineAmount(text,labels);
+    }
     const requiredSocialKeys=['employmentInsurance','healthInsurance','healthInsuranceSpecial','nursingCare','pension'];
     const socialRequiredOk=requiredSocialKeys.every(k=>Number.isFinite(socialComponents[k]));
     const socialTotal=socialRequiredOk?(requiredSocialKeys.reduce((a,k)=>a+(Number(socialComponents[k])||0),0)+(Number.isFinite(socialComponents.childSupport)?Number(socialComponents.childSupport):0)):null;
@@ -765,12 +797,18 @@ const FurusatoGoogleDrive = (() => {
     if(text&&typeof text==='object'&&text.ocrText){
       const o=parseSalaryComponents({text:text.ocrText,pages:[]});
       const f=ocrPayrollFallback(text,'salary')||{};
+      const mergedSocial={...(c.socialComponents||{})};
+      for(const source of [o.socialComponents||{},f.socialComponents||{}]){
+        for(const k of ['employmentInsurance','healthInsurance','healthInsuranceSpecial','nursingCare','childSupport','pension']){
+          if(Number.isFinite(source[k]))mergedSocial[k]=source[k];
+        }
+      }
       c={...c,
         taxableGross:f.taxableGross??o.taxableGross??c.taxableGross,
         grossTotal:f.grossTotal??o.grossTotal??c.grossTotal,
         nonTaxableTotal:f.nonTaxableTotal??o.nonTaxableTotal??c.nonTaxableTotal,
         socialTotal:f.socialTotal??o.socialTotal??c.socialTotal,
-        socialComponents:f.socialComponents??o.socialComponents??c.socialComponents
+        socialComponents:mergedSocial
       };
       if(!c.components?.length&&o.grossComponents?.length)c={...c,grossComponents:o.grossComponents};
       if(c.taxableGross!=null&&c.nonTaxableTotal!=null&&c.grossTotal==null)c.grossTotal=c.taxableGross+c.nonTaxableTotal;
@@ -861,8 +899,24 @@ const FurusatoGoogleDrive = (() => {
     const raw=typeof text==='string'?text:(text?.text||''); const d=extractDateParts(raw,name);
     let amount=extractExactYenAfterLabel(text,['支給額','支給合計（A)','支給合計(A)','Total Payment']);
     const taxableGross=extractExactYenAfterLabel(text,['課税対象額','Taxable Amount']) ?? amount;
-    const socialLabels={employmentInsurance:['雇用保険料'],healthInsurance:['健康保険料（基本）','健康保険料 (基本)'],healthInsuranceSpecial:['健康保険料（特定）','健康保険料 (特定)'],nursingCare:['介護保険料'],childSupport:['子ども・子育て支援金','子ども 子育て支援金','子ども子育て支援金'],pension:['年金保険料','厚生年金保険料']};
-    const socialComponents={}; for(const [k,labels] of Object.entries(socialLabels))socialComponents[k]=extractExactYenAfterLabel(text,labels);
+    const socialLabels={employmentInsurance:['雇用保険料'],healthInsurance:['健康保険料（基本）','健康保険料 (基本)','健康保険料（基本'],healthInsuranceSpecial:['健康保険料（特定）','健康保険料 (特定)','健康保険料（特定'],nursingCare:['介護保険料'],childSupport:['子ども・子育て支援金','子ども 子育て支援金','子ども子育て支援金'],pension:['年金保険料','厚生年金保険料']};
+    const socialComponents={};
+    for(const [k,labels] of Object.entries(socialLabels)){
+      socialComponents[k]=extractExactYenAfterLabel(text,labels);
+      if(!Number.isFinite(socialComponents[k])){
+        const raw=typeof text==='string'?text:String(text?.text||'');
+        const compact=v=>String(v||'').replace(/[\s\u3000()（）「」［］【】・･:：]/g,'').toLowerCase();
+        for(const line of raw.replace(/\r/g,'').split(/\n+/)){
+          const lc=compact(line);
+          const hit=(labels||[]).find(label=>lc.includes(compact(label)));
+          if(!hit)continue;
+          const idx=lc.indexOf(compact(hit)); let rp=0,cp=0;
+          while(rp<line.length&&cp<idx+compact(hit).length){const ch=line[rp++];if(/[\s\u3000()（）「」［］【】・･:：]/.test(ch))continue;cp++;}
+          const v=extractNumericTokens(line.slice(rp)).map(x=>x.n).find(n=>n<1900||n>2100);
+          if(v!=null){socialComponents[k]=v;break;}
+        }
+      }
+    }
     const nums=allOcrNumbers(text);
     // OCR sometimes loses every summary label. Recover the bonus amount,
     // deduction and net only from the identity amount = deduction + net.
@@ -1051,7 +1105,7 @@ const FurusatoGoogleDrive = (() => {
     }
     return false;
   }
-  const PARSED_DB_VERSION='20260924-db4';
+  const PARSED_DB_VERSION='20260925-db5';
   function documentSignature(f){return `${f.id||f.name||''}|${f.modifiedTime||''}|${f.size||''}`;}
   function archiveYear(state,year){
     const y=Number(year); if(!Number.isFinite(y)||y<2024||y>2100)return null;
@@ -1081,7 +1135,7 @@ const FurusatoGoogleDrive = (() => {
       for(const d of (a?.documents||[])){
         if(String(d.driveFileId||d.id||d.name||'')!==key)continue;
         const sameSignature=d.signature===documentSignature(f);
-        const complete=d.parserVersion===PARSED_DB_VERSION && d.readData?.version==='20260924-readout2' && (String(d.readData?.pdfText||'').length>0 || String(d.readData?.ocrText||'').length>0) && Array.isArray(d.readData?.lines) && Array.isArray(d.missingFields) && d.missingFields.length===0;
+        const complete=d.parserVersion===PARSED_DB_VERSION && d.readData?.version==='20260925-readout3' && (String(d.readData?.pdfText||'').length>0 || String(d.readData?.ocrText||'').length>0) && Array.isArray(d.readData?.lines) && Array.isArray(d.missingFields) && d.missingFields.length===0;
         if(sameSignature&&complete)return {year:Number(yk),detail:d};
       }
     }
