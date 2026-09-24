@@ -269,6 +269,45 @@ const FurusatoGoogleDrive = (() => {
     }catch(e){diag({stage:'ocrError',type,name,error:e?.stack||e?.message||String(e),attempts:attempts.map(x=>({psm:x.ocrPsm,lang:x.ocrLang,chars:String(x.text||'').length,confidence:x.ocrConfidence||0,words:Array.isArray(x.words)?x.words.length:0,sample:String(x.text||'').slice(0,300),width:x.ocrWidth||0,height:x.ocrHeight||0,imageBytes:x.imageBytes||0,cornerNonWhite:x.cornerNonWhite||0,cornerMean:x.cornerMean||0}))});return {...base,text:raw,ocrText:'',ocrUsed:true,ocrError:e?.message||String(e),ocrAttempts:attempts.map(x=>({psm:x.ocrPsm,lang:x.ocrLang,chars:String(x.text||'').length,confidence:x.ocrConfidence||0,words:Array.isArray(x.words)?x.words.length:0,valid:false})),ocrValidated:false};}
     return {...base,text:raw,ocrUsed:true,ocrError:'OCR結果が空でした'};
   }
+  function buildReadData(pdf,name=''){
+    const pdfText=String(pdf?.text||'');
+    const ocrText=String(pdf?.ocrText||'');
+    const combined=[pdfText,ocrText].filter(Boolean).join('\n');
+    const lines=[];
+    const seen=new Set();
+    for(const rawLine of combined.replace(/\r/g,'').split(/\n+/)){
+      const line=String(rawLine||'').replace(/[ \t\u3000]+/g,' ').trim();
+      if(!line)continue;
+      const amounts=extractNumericTokens(line).map(x=>({value:x.n,raw:x.text,index:x.index}));
+      const key=line+'|'+amounts.map(x=>x.value).join(',');
+      if(seen.has(key))continue;
+      seen.add(key);
+      lines.push({text:line,amounts});
+    }
+    const numericValues=[]; const nvSeen=new Set();
+    for(const row of lines){
+      for(const a of row.amounts){
+        const key=`${a.value}|${row.text}`;
+        if(nvSeen.has(key))continue; nvSeen.add(key);
+        numericValues.push({value:a.value,raw:a.raw,context:row.text});
+      }
+    }
+    return {
+      version:'20260924-readout1',
+      document:String(name||''),
+      pdfText,
+      ocrText,
+      preferredText:ocrText||pdfText,
+      lines,
+      numericValues,
+      pageCount:Number(pdf?.pageCount||0),
+      textItemCount:Number(pdf?.textItemCount||0),
+      ocrUsed:!!pdf?.ocrUsed,
+      ocrConfidence:Number(pdf?.ocrConfidence||0),
+      ocrWordCount:Number(pdf?.ocrWordCount||0),
+      ocrValidated:!!pdf?.ocrValidated
+    };
+  }
   function classifyPdfText(text,name=''){
     const n=String(name||''); const t=`${n}\n${String(text||'')}`;
     const byName=candidateTypeFromName(n);
@@ -1004,7 +1043,7 @@ const FurusatoGoogleDrive = (() => {
     }
     return false;
   }
-  const PARSED_DB_VERSION='20260924-db3';
+  const PARSED_DB_VERSION='20260924-db4';
   function documentSignature(f){return `${f.id||f.name||''}|${f.modifiedTime||''}|${f.size||''}`;}
   function archiveYear(state,year){
     const y=Number(year); if(!Number.isFinite(y)||y<2024||y>2100)return null;
@@ -1034,7 +1073,7 @@ const FurusatoGoogleDrive = (() => {
       for(const d of (a?.documents||[])){
         if(String(d.driveFileId||d.id||d.name||'')!==key)continue;
         const sameSignature=d.signature===documentSignature(f);
-        const complete=d.parserVersion===PARSED_DB_VERSION && Array.isArray(d.missingFields) && d.missingFields.length===0;
+        const complete=d.parserVersion===PARSED_DB_VERSION && d.readData?.version==='20260924-readout1' && (String(d.readData?.pdfText||'').length>0 || String(d.readData?.ocrText||'').length>0) && Array.isArray(d.readData?.lines) && Array.isArray(d.missingFields) && d.missingFields.length===0;
         if(sameSignature&&complete)return {year:Number(yk),detail:d};
       }
     }
@@ -1070,7 +1109,7 @@ const FurusatoGoogleDrive = (() => {
         result.cacheMisses++; result.downloads++; onProgress?.(`解析中: ${f.name}`);
         const buf=await downloadPdf(f.id); let pdf=await pdfText(buf); pdf=await ensurePdfText(buf,pdf,f.name); result.parsed++;
         const text=pdf.text||'', detectedType=classifyPdfText(text,f.name), type=detectedType==='unknown'?({salary:'salary_slip',bonus:'bonus_slip',withholding:'withholding'}[f.candidateType]||detectedType):detectedType;
-        let detail={name:f.name,id:f.id,driveFileId:f.id,type:f.candidateType,detectedType,filenameYear:f.filenameYear||null,modifiedTime:f.modifiedTime||'',size:f.size||'',signature:documentSignature(f),parserVersion:PARSED_DB_VERSION,textChars:String(text).length,textItemCount:pdf.textItemCount||0,rawText:text,ocrUsed:!!pdf.ocrUsed,ocrConfidence:pdf.ocrConfidence||0,ocrError:pdf.ocrError||'',ocrWordCount:pdf.ocrWordCount||0,ocrValidated:!!pdf.ocrValidated,pageCount:pdf.pageCount||0,pageMeta:pdf.pageMeta||[],ocrAttempts:pdf.ocrAttempts||[]};
+        let detail={name:f.name,id:f.id,driveFileId:f.id,type:f.candidateType,detectedType,filenameYear:f.filenameYear||null,modifiedTime:f.modifiedTime||'',size:f.size||'',signature:documentSignature(f),parserVersion:PARSED_DB_VERSION,textChars:String(text).length,textItemCount:pdf.textItemCount||0,rawText:text,ocrUsed:!!pdf.ocrUsed,ocrConfidence:pdf.ocrConfidence||0,ocrError:pdf.ocrError||'',ocrWordCount:pdf.ocrWordCount||0,ocrValidated:!!pdf.ocrValidated,pageCount:pdf.pageCount||0,pageMeta:pdf.pageMeta||[],ocrAttempts:pdf.ocrAttempts||[],readData:buildReadData(pdf,f.name)};
         if(type==='salary_slip'){
           const x=parseSalaryPdf(pdf,f.name); Object.assign(detail,{year:x.year||null,month:x.month||null,gross:x.gross||0,taxableGross:x.taxableGross||0,grossTotal:x.grossTotal||0,nonTaxableTotal:x.nonTaxableTotal??null,social:x.social??null,socialComponents:x.socialComponents||{},components:x.components||[],unknownComponents:x.unknownComponents||[],needsReview:!!x.needsReview,missingFields:salaryMissing(x),parsed:x});
           if(pdf.ocrUsed)result.salaryOcr++;
