@@ -253,9 +253,9 @@ const FurusatoGoogleDrive = (() => {
       const nonEmpty=attempts.filter(x=>String(x.text||'').trim().length>=20);
       if(!nonEmpty.length)throw new Error('OCR結果が空または短すぎます');
       const mergedText=nonEmpty.map(x=>`[Page ${x.pageNumber||1}]\n${String(x.text||'')}`).join('\n');
-      const parseAttempt=(a)=>{
+      const parseAttempt=(attempt)=>{
         try{
-          const q={...a,ocrText:a.text,ocrUsed:true};
+          const q={...attempt,ocrText:attempt.text,ocrUsed:true};
           if(type==='salary')return !parseSalaryPdf(q,name).needsReview;
           if(type==='bonus')return !parseBonusPdf(q,name).needsReview;
           if(type==='withholding')return !parseWithholdingPdf(q,name).needsReview;
@@ -263,15 +263,15 @@ const FurusatoGoogleDrive = (() => {
         return false;
       };
       const valid=nonEmpty.filter(parseAttempt);
-      const ranked=(valid.length?valid:nonEmpty).slice().sort((a,b)=>{
-        const av=ocrQuality(a.text,a.ocrConfidence),bv=ocrQuality(b.text,b.ocrConfidence);
+      const ranked=(valid.length?valid:nonEmpty).slice().sort((left,right)=>{
+        const av=ocrQuality(left.text,left.ocrConfidence),bv=ocrQuality(right.text,right.ocrConfidence);
         return bv-av;
       });
       const best=ranked[0];
       const wordSource=valid.find(x=>!x.ocrRegion&&Array.isArray(x.words)&&x.words.length)
         ||nonEmpty.find(x=>!x.ocrRegion&&Array.isArray(x.words)&&x.words.length)
         ||best;
-      return {...base,text:mergedText,ocrText:mergedText,ocrUsed:true,ocrConfidence:Math.max(...attempts.map(x=>Number(x.ocrConfidence||0))),ocrPsm:attempts.map(x=>`p${x.pageNumber||1}:${x.ocrPsm}`).join(','),ocrWords:wordSource.words||[],ocrWordCount:Array.isArray(wordSource.words)?wordSource.words.length:0,ocrWidth:wordSource.ocrWidth,ocrHeight:wordSource.ocrHeight,ocrPages:nonEmpty.map(x=>({pageNumber:x.pageNumber||1,text:String(x.text||''),confidence:Number(x.ocrConfidence||0),psm:x.ocrPsm,lang:x.ocrLang,words:Array.isArray(x.words)?x.words:[],width:x.ocrWidth,height:x.ocrHeight,region:!!x.ocrRegion})),ocrAttempts:attempts.map(x=>({pageNumber:x.pageNumber||1,psm:x.ocrPsm,lang:x.ocrLang,chars:String(x.text||'').length,confidence:x.ocrConfidence||0,words:Array.isArray(x.words)?x.words.length:0,valid:valid.includes(x),region:!!x.ocrRegion})),ocrValidated:valid.length>0};
+      return {...base,text:raw,ocrText:mergedText,ocrUsed:true,ocrConfidence:Math.max(...attempts.map(x=>Number(x.ocrConfidence||0))),ocrPsm:attempts.map(x=>`p${x.pageNumber||1}:${x.ocrPsm}`).join(','),ocrWords:wordSource.words||[],ocrWordCount:Array.isArray(wordSource.words)?wordSource.words.length:0,ocrWidth:wordSource.ocrWidth,ocrHeight:wordSource.ocrHeight,ocrPages:nonEmpty.map(x=>({pageNumber:x.pageNumber||1,text:String(x.text||''),confidence:Number(x.ocrConfidence||0),psm:x.ocrPsm,lang:x.ocrLang,words:Array.isArray(x.words)?x.words:[],width:x.ocrWidth,height:x.ocrHeight,region:!!x.ocrRegion})),ocrAttempts:attempts.map(x=>({pageNumber:x.pageNumber||1,psm:x.ocrPsm,lang:x.ocrLang,chars:String(x.text||'').length,confidence:x.ocrConfidence||0,words:Array.isArray(x.words)?x.words.length:0,valid:valid.includes(x),region:!!x.ocrRegion})),ocrValidated:valid.length>0};
     }catch(e){diag({stage:'ocrError',type,name,error:e?.stack||e?.message||String(e),attempts:attempts.map(x=>({psm:x.ocrPsm,lang:x.ocrLang,chars:String(x.text||'').length,confidence:x.ocrConfidence||0,words:Array.isArray(x.words)?x.words.length:0,sample:String(x.text||'').slice(0,300),width:x.ocrWidth||0,height:x.ocrHeight||0,imageBytes:x.imageBytes||0,cornerNonWhite:x.cornerNonWhite||0,cornerMean:x.cornerMean||0}))});return {...base,text:raw,ocrText:'',ocrUsed:true,ocrError:e?.message||String(e),ocrAttempts:attempts.map(x=>({psm:x.ocrPsm,lang:x.ocrLang,chars:String(x.text||'').length,confidence:x.ocrConfidence||0,words:Array.isArray(x.words)?x.words.length:0,valid:false})),ocrValidated:false};}
     return {...base,text:raw,ocrUsed:true,ocrError:'OCR結果が空でした'};
   }
@@ -299,11 +299,11 @@ const FurusatoGoogleDrive = (() => {
       }
     }
     return {
-      version:'20260925-readout4',
+      version:'20260925-readout5',
       document:String(name||''),
       pdfText,
       ocrText,
-      preferredText:ocrText||pdfText,
+      preferredText:pdfText||ocrText,
       lines,
       numericValues,
       pageCount:Number(pdf?.pageCount||0),
@@ -848,7 +848,7 @@ const FurusatoGoogleDrive = (() => {
       const socialTotal=(socialOk?requiredSocialKeys.reduce((a,k)=>a+(Number(c.socialComponents?.[k])||0),0)+(Number.isFinite(c.socialComponents?.childSupport)?Number(c.socialComponents.childSupport):0):null);
       const unknown=[...(c.grossTotal==null?['支給合計']:[]),...(c.nonTaxableTotal==null?['非課税分']:[]),...(c.taxableGross==null?['課税対象額']:[])];
       for(const k of requiredSocialKeys)if(!Number.isFinite(c.socialComponents?.[k]))unknown.push(`社会保険料:${k}`);
-      const ocrChildLabelPresent=/子ども[・\s]*子育て支援金/.test(String(a.text||'').replace(/[（）()]/g,''));
+      const ocrChildLabelPresent=/子ども[・\s]*子育て支援金/.test(String((text&&typeof text==='object'?text.ocrText:'')||'').replace(/[（）()]/g,''));
       if(ocrChildLabelPresent&&!Number.isFinite(c.socialComponents?.childSupport))unknown.push('社会保険料:childSupport');
       c={...c,socialTotal,unknownComponents:unknown,arithmeticOk:derived!=null&&c.taxableGross===derived&&socialOk,needsReview:!(derived!=null&&c.taxableGross===derived&&socialOk)};
     }
@@ -1138,7 +1138,7 @@ const FurusatoGoogleDrive = (() => {
     }
     return false;
   }
-  const PARSED_DB_VERSION='20260925-db6';
+  const PARSED_DB_VERSION='20260925-db7';
   function documentSignature(f){return `${f.id||f.name||''}|${f.modifiedTime||''}|${f.size||''}`;}
   function archiveYear(state,year){
     const y=Number(year); if(!Number.isFinite(y)||y<2024||y>2100)return null;
@@ -1168,7 +1168,7 @@ const FurusatoGoogleDrive = (() => {
       for(const d of (a?.documents||[])){
         if(String(d.driveFileId||d.id||d.name||'')!==key)continue;
         const sameSignature=d.signature===documentSignature(f);
-        const complete=d.parserVersion===PARSED_DB_VERSION && d.readData?.version==='20260925-readout4' && (String(d.readData?.pdfText||'').length>0 || String(d.readData?.ocrText||'').length>0) && Array.isArray(d.readData?.lines) && Array.isArray(d.missingFields) && d.missingFields.length===0;
+        const complete=d.parserVersion===PARSED_DB_VERSION && d.readData?.version==='20260925-readout5' && (String(d.readData?.pdfText||'').length>0 || String(d.readData?.ocrText||'').length>0) && Array.isArray(d.readData?.lines) && Array.isArray(d.missingFields) && d.missingFields.length===0;
         if(sameSignature&&complete)return {year:Number(yk),detail:d};
       }
     }
