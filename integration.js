@@ -173,7 +173,8 @@ const FurusatoGoogleDrive = (() => {
   }
   async function ocrPageFromPdfDoc(doc,region=null,options={}){
     if(!doc)throw new Error('OCR用PDFドキュメントがありません');
-    const page=await doc.getPage(1); const scale=Number(options.scale||region?.scale||3.0); const full=page.getViewport({scale});
+    const pageNumber=Math.max(1,Math.min(Number(options.pageNumber||1),doc.numPages||1));
+    const page=await doc.getPage(pageNumber); const scale=Number(options.scale||region?.scale||3.0); const full=page.getViewport({scale});
     const r=region||{x0:0,y0:0,x1:1,y1:1};
     const sx=Math.max(0,Math.min(1,Number(r.x0)||0)),sy=Math.max(0,Math.min(1,Number(r.y0)||0));
     const ex=Math.max(sx,Math.min(1,Number(r.x1)==null?1:Number(r.x1))),ey=Math.max(sy,Math.min(1,Number(r.y1)==null?1:Number(r.y1)));
@@ -200,7 +201,7 @@ const FurusatoGoogleDrive = (() => {
     lastOcrImageDataUrl=imageDataUrl;
     const rOcr=await window.Tesseract.recognize(imageDataUrl,lang,{tessedit_pageseg_mode:psm,preserve_interword_spaces:'1'});
     const data=rOcr?.data||{};
-    const result={text:String(data.text||''),words:Array.isArray(data.words)?data.words:[],pages:[],pageCount:doc.numPages,textItemCount:0,ocrUsed:true,ocrConfidence:Number(data.confidence||0),ocrPsm:psm,ocrLang:lang,ocrWidth:cw,ocrHeight:ch,ocrRegion:!!region,imageBytes:imageDataUrl.length,cornerNonWhite:nonWhite,cornerMean:sample.length?sum/(sample.length/4):255,renderSampleWidth:statW,renderSampleHeight:statH,renderNonWhite:fullNonWhite,renderNonWhiteRatio:fullPixels?fullNonWhite/fullPixels:0,renderMean:fullPixels?fullSum/fullPixels:255,renderMin:fullMin,renderMax:fullMax};
+    const result={text:String(data.text||''),words:Array.isArray(data.words)?data.words:[],pages:[],pageCount:doc.numPages,pageNumber,textItemCount:0,ocrUsed:true,ocrConfidence:Number(data.confidence||0),ocrPsm:psm,ocrLang:lang,ocrWidth:cw,ocrHeight:ch,ocrRegion:!!region,imageBytes:imageDataUrl.length,cornerNonWhite:nonWhite,cornerMean:sample.length?sum/(sample.length/4):255,renderSampleWidth:statW,renderSampleHeight:statH,renderNonWhite:fullNonWhite,renderNonWhiteRatio:fullPixels?fullNonWhite/fullPixels:0,renderMean:fullPixels?fullSum/fullPixels:255,renderMin:fullMin,renderMax:fullMax};
     diag({stage:'ocr',psm,lang,chars:result.text.length,words:result.words.length,confidence:result.ocrConfidence,width:cw,height:ch,imageBytes:result.imageBytes,cornerNonWhite:result.cornerNonWhite,cornerMean:result.cornerMean,renderSampleWidth:statW,renderSampleHeight:statH,renderNonWhite:fullNonWhite,renderNonWhiteRatio:result.renderNonWhiteRatio,renderMean:result.renderMean,renderMin:result.renderMin,renderMax:result.renderMax,region:!!region,sample:result.text.slice(0,300)});
     return result;
   }
@@ -224,29 +225,34 @@ const FurusatoGoogleDrive = (() => {
     if(!base.pdfDoc)return {...base,ocrUsed:false,ocrError:'PDFの文字レイヤーが取得できませんでした'};
     const attempts=[];
     try{
-      // Keep both layouts. Sparse PSM 11 is good at Japanese labels, while PSM
-      // 6 often preserves the numeric summary row. Choosing only one can lose
-      // either the label or its value, so the parser receives their union.
-      attempts.push(await ocrPageFromPdfDoc(base.pdfDoc,null,{scale:2.5,psm:11,lang:'jpn'}));
-      attempts.push(await ocrPageFromPdfDoc(base.pdfDoc,null,{scale:2.5,psm:6,lang:'jpn'}));
-      const firstText=attempts.map(x=>String(x.text||'')).join('\n');
-      // Numeric fields on this payroll are often recognized more reliably by the
-      // English model than by the mixed Japanese model. Use it only when the
-      // first OCR pass is too sparse; this is a fallback, not the primary parser.
-      if(ocrQuality(firstText,Math.max(...attempts.map(x=>Number(x.ocrConfidence||0))))<260){
-        attempts.push(await ocrPageFromPdfDoc(base.pdfDoc,null,{scale:2.5,psm:11,lang:'eng'}));
+      // OCR every page, not just page 1. Some Drive PDFs have a cover/header page
+      // followed by the actual payroll data. The previous implementation silently
+      // discarded those later pages, which is why the DB could contain only a few
+      // dozen OCR characters even though the PDF visibly had much more information.
+      const pageCount=Math.max(1,Number(base.pageCount||base.pdfDoc.numPages||1));
+      for(let pageNumber=1;pageNumber<=pageCount;pageNumber++){
+        attempts.push(await ocrPageFromPdfDoc(base.pdfDoc,null,{scale:2.5,psm:11,lang:'jpn',pageNumber}));
+        const pageText=String(attempts[attempts.length-1]?.text||'');
+        const pageQuality=ocrQuality(pageText,Number(attempts[attempts.length-1]?.ocrConfidence||0));
+        if(pageQuality<260){
+          attempts.push(await ocrPageFromPdfDoc(base.pdfDoc,null,{scale:2.5,psm:6,lang:'jpn',pageNumber}));
+        }
+        if(pageQuality<180){
+          attempts.push(await ocrPageFromPdfDoc(base.pdfDoc,null,{scale:2.5,psm:11,lang:'eng',pageNumber}));
+        }
       }
-      if(type==='salary' && ocrQuality(attempts.map(x=>x.text).join('\n'),Math.max(...attempts.map(x=>x.ocrConfidence||0)))<260){
-        attempts.push(await ocrPageFromPdfDoc(base.pdfDoc,{x0:0,y0:0.68,x1:0.75,y1:1},{scale:2.5,psm:11,lang:'jpn'}));
+      const firstText=attempts.map(x=>String(x.text||'')).join('\n');
+      // If the full-page passes are still sparse, retry the lower portion of each
+      // salary page where the summary/social-insurance rows are located.
+      if(type==='salary' && ocrQuality(firstText,Math.max(...attempts.map(x=>Number(x.ocrConfidence||0))))<260){
+        const pageCount2=Math.max(1,Number(base.pageCount||base.pdfDoc.numPages||1));
+        for(let pageNumber=1;pageNumber<=pageCount2;pageNumber++){
+          attempts.push(await ocrPageFromPdfDoc(base.pdfDoc,{x0:0,y0:0.62,x1:1,y1:1},{scale:2.8,psm:11,lang:'jpn',pageNumber}));
+        }
       }
       const nonEmpty=attempts.filter(x=>String(x.text||'').trim().length>=20);
       if(!nonEmpty.length)throw new Error('OCR結果が空または短すぎます');
-      const mergedText=nonEmpty.map(x=>String(x.text||'')).join('\n');
-      // Do not merely choose the OCR pass with the most characters. A pass can
-      // be long but still be useless for payroll parsing. Prefer a pass that
-      // independently produces a validated record, then use quality as the
-      // tie-breaker. This directly guards the former "OCR=実行／文字数だけ"
-      // false-success path.
+      const mergedText=nonEmpty.map(x=>`[Page ${x.pageNumber||1}]\n${String(x.text||'')}`).join('\n');
       const parseAttempt=(a)=>{
         try{
           const q={...a,ocrText:a.text,ocrUsed:true};
@@ -265,7 +271,7 @@ const FurusatoGoogleDrive = (() => {
       const wordSource=valid.find(x=>!x.ocrRegion&&Array.isArray(x.words)&&x.words.length)
         ||nonEmpty.find(x=>!x.ocrRegion&&Array.isArray(x.words)&&x.words.length)
         ||best;
-      return {...base,text:mergedText,ocrText:mergedText,ocrUsed:true,ocrConfidence:Math.max(...attempts.map(x=>Number(x.ocrConfidence||0))),ocrPsm:attempts.map(x=>x.ocrPsm).join(','),ocrWords:wordSource.words||[],ocrWordCount:Array.isArray(wordSource.words)?wordSource.words.length:0,ocrWidth:wordSource.ocrWidth,ocrHeight:wordSource.ocrHeight,ocrAttempts:attempts.map(x=>({psm:x.ocrPsm,lang:x.ocrLang,chars:String(x.text||'').length,confidence:x.ocrConfidence||0,words:Array.isArray(x.words)?x.words.length:0,valid:valid.includes(x)})),ocrValidated:valid.length>0};
+      return {...base,text:mergedText,ocrText:mergedText,ocrUsed:true,ocrConfidence:Math.max(...attempts.map(x=>Number(x.ocrConfidence||0))),ocrPsm:attempts.map(x=>`p${x.pageNumber||1}:${x.ocrPsm}`).join(','),ocrWords:wordSource.words||[],ocrWordCount:Array.isArray(wordSource.words)?wordSource.words.length:0,ocrWidth:wordSource.ocrWidth,ocrHeight:wordSource.ocrHeight,ocrPages:nonEmpty.map(x=>({pageNumber:x.pageNumber||1,text:String(x.text||''),confidence:Number(x.ocrConfidence||0),psm:x.ocrPsm,lang:x.ocrLang,words:Array.isArray(x.words)?x.words:[],width:x.ocrWidth,height:x.ocrHeight,region:!!x.ocrRegion})),ocrAttempts:attempts.map(x=>({pageNumber:x.pageNumber||1,psm:x.ocrPsm,lang:x.ocrLang,chars:String(x.text||'').length,confidence:x.ocrConfidence||0,words:Array.isArray(x.words)?x.words.length:0,valid:valid.includes(x),region:!!x.ocrRegion})),ocrValidated:valid.length>0};
     }catch(e){diag({stage:'ocrError',type,name,error:e?.stack||e?.message||String(e),attempts:attempts.map(x=>({psm:x.ocrPsm,lang:x.ocrLang,chars:String(x.text||'').length,confidence:x.ocrConfidence||0,words:Array.isArray(x.words)?x.words.length:0,sample:String(x.text||'').slice(0,300),width:x.ocrWidth||0,height:x.ocrHeight||0,imageBytes:x.imageBytes||0,cornerNonWhite:x.cornerNonWhite||0,cornerMean:x.cornerMean||0}))});return {...base,text:raw,ocrText:'',ocrUsed:true,ocrError:e?.message||String(e),ocrAttempts:attempts.map(x=>({psm:x.ocrPsm,lang:x.ocrLang,chars:String(x.text||'').length,confidence:x.ocrConfidence||0,words:Array.isArray(x.words)?x.words.length:0,valid:false})),ocrValidated:false};}
     return {...base,text:raw,ocrUsed:true,ocrError:'OCR結果が空でした'};
   }
@@ -293,7 +299,7 @@ const FurusatoGoogleDrive = (() => {
       }
     }
     return {
-      version:'20260924-readout1',
+      version:'20260924-readout2',
       document:String(name||''),
       pdfText,
       ocrText,
@@ -305,7 +311,9 @@ const FurusatoGoogleDrive = (() => {
       ocrUsed:!!pdf?.ocrUsed,
       ocrConfidence:Number(pdf?.ocrConfidence||0),
       ocrWordCount:Number(pdf?.ocrWordCount||0),
-      ocrValidated:!!pdf?.ocrValidated
+      ocrValidated:!!pdf?.ocrValidated,
+      pageTexts:Array.isArray(pdf?.pages)?pdf.pages.map((items,i)=>({page:i+1,text:(items||[]).slice().sort((a,b)=>Number(b.y||0)-Number(a.y||0)||Number(a.x||0)-Number(b.x||0)).map(x=>String(x.str||'')).join(' '),items:(items||[]).map(x=>({str:String(x.str||''),x:Number(x.x||0),y:Number(x.y||0),width:Number(x.width||0),height:Number(x.height||0)}))})):[],
+      ocrPages:Array.isArray(pdf?.ocrPages)?pdf.ocrPages.map(x=>({pageNumber:Number(x.pageNumber||1),text:String(x.text||''),confidence:Number(x.confidence||0),psm:x.psm||'',lang:x.lang||'',words:Array.isArray(x.words)?x.words.map(w=>({text:String(w.text||w.str||''),bbox:w.bbox||null,confidence:Number(w.confidence??w.conf??0)})):[],width:Number(x.width||0),height:Number(x.height||0),region:!!x.region})):[]
     };
   }
   function classifyPdfText(text,name=''){
@@ -1073,7 +1081,7 @@ const FurusatoGoogleDrive = (() => {
       for(const d of (a?.documents||[])){
         if(String(d.driveFileId||d.id||d.name||'')!==key)continue;
         const sameSignature=d.signature===documentSignature(f);
-        const complete=d.parserVersion===PARSED_DB_VERSION && d.readData?.version==='20260924-readout1' && (String(d.readData?.pdfText||'').length>0 || String(d.readData?.ocrText||'').length>0) && Array.isArray(d.readData?.lines) && Array.isArray(d.missingFields) && d.missingFields.length===0;
+        const complete=d.parserVersion===PARSED_DB_VERSION && d.readData?.version==='20260924-readout2' && (String(d.readData?.pdfText||'').length>0 || String(d.readData?.ocrText||'').length>0) && Array.isArray(d.readData?.lines) && Array.isArray(d.missingFields) && d.missingFields.length===0;
         if(sameSignature&&complete)return {year:Number(yk),detail:d};
       }
     }
@@ -1097,7 +1105,7 @@ const FurusatoGoogleDrive = (() => {
   function bonusMissing(x){return [...new Set([...(x.year?[]:['年']),...(x.date?[]:['支給日']),...(Number(x.amount)>0?[]:['賞与額']),...(x.season?[]:['夏冬区分'])])];}
   function withholdingMissing(x){return [...new Set([...(x.year?[]:['年']),...(Number(x.annualSalary)>0?[]:['給与収入']),...(Number(x.salaryIncomeAfterDeduction)>0?[]:['給与所得控除後の金額']),...(Number(x.deductionsTotal)>0?[]:['所得控除の額の合計額']),...(Number(x.social)>=0?[]:['社会保険料等の金額']),...(Number(x.basicDeduction)>0?[]:['基礎控除'])])];}
   async function scanAndImport(state,onProgress,filesOverride){
-    const targetYear=Number(state.importSettings?.targetYear||state.year||new Date().getFullYear()), priorYear=targetYear-1;
+    const targetYear=new Date().getFullYear(), priorYear=targetYear-1;
     state.year=targetYear; state.yearPayrollRecords=state.yearPayrollRecords&&typeof state.yearPayrollRecords==='object'?state.yearPayrollRecords:{};
     const files=Array.isArray(filesOverride)?filesOverride:await listCandidateFiles(targetYear);
     const result={files:files.length,added:0,review:0,skipped:0,errors:[],cacheHits:0,cacheMisses:0,downloads:0,parsed:0,salaryCandidates:files.filter(f=>f.candidateType==='salary').length,salaryImported:0,salaryReview:0,salaryParsed:0,salaryOcr:0,salaryRejected:0,candidates:files.map(f=>({name:f.name,type:f.candidateType,year:f.filenameYear}))};
