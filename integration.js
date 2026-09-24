@@ -299,7 +299,7 @@ const FurusatoGoogleDrive = (() => {
       }
     }
     return {
-      version:'20260925-readout3',
+      version:'20260925-readout4',
       document:String(name||''),
       pdfText,
       ocrText,
@@ -702,7 +702,27 @@ const FurusatoGoogleDrive = (() => {
     // amounts (bank transfers, standard remuneration, deductions, etc.).
     let grossTotal=extractExactYenAfterLabel(text,['支給合計（A)','支給合計(A)','Total Payment']);
     let nonTaxableTotal=extractExactYenAfterLabel(text,['（内通勤補助費等非課税分)','(内通勤補助費等非課税分)','Non-taxable Amount','Non‑taxable Amount','Non-taxabl e Anount','Non‑taxabl e Anount','Non-taxable Anount']);
-    let explicitTaxable=extractExactYenAfterLabel(text,['課税対象額','Taxable Amount']);
+    // Prefer the Japanese summary label. The PDF header also contains the
+    // phrase "Taxable amount from January"; treating that as the field label
+    // can grab an unrelated nearby number (this is what made April look like
+    // 13,500円 in an earlier parser). Only fall back to the standalone English
+    // label when the Japanese label is genuinely absent.
+    const rawSalaryForLabel=String(typeof text==='string'?text:text?.text||'');
+    const hasJapaneseTaxableLabel=/課税対象額/.test(rawSalaryForLabel);
+    let explicitTaxable=hasJapaneseTaxableLabel
+      ? extractExactYenAfterLabel(text,['課税対象額'])
+      : extractExactYenAfterLabel(text,['Taxable Amount']);
+    // Toyota monthly payroll slips do NOT use the same "支給合計(A)" label as
+    // the bonus slip.  The reliable summary is "課税対象額" + "非課税分".
+    // The old parser treated the missing "支給合計(A)" as a fatal error and
+    // unnecessarily fell back to OCR; on iPhone that produced tiny/poor OCR
+    // results and made an otherwise perfectly readable PDF look unreadable.
+    // Therefore derive the gross total from the two explicit summary values
+    // whenever both are available. This is an arithmetic derivation, not a
+    // visual-nearest-number guess.
+    if(grossTotal==null && explicitTaxable!=null && nonTaxableTotal!=null){
+      grossTotal=explicitTaxable+nonTaxableTotal;
+    }
     if(text&&typeof text==='object'&&text.ocrUsed)explicitTaxable=extractOcrSameLineNumber(text,['Taxable Anount','Taxable Amount'])??explicitTaxable;
     // OCR can drop the labels but still recognize all three summary numbers.
     // Recover them only when an exact arithmetic relation proves the values.
@@ -760,7 +780,11 @@ const FurusatoGoogleDrive = (() => {
     }
     const requiredSocialKeys=['employmentInsurance','healthInsurance','healthInsuranceSpecial','nursingCare','pension'];
     const socialRequiredOk=requiredSocialKeys.every(k=>Number.isFinite(socialComponents[k]));
-    const socialTotal=socialRequiredOk?(requiredSocialKeys.reduce((a,k)=>a+(Number(socialComponents[k])||0),0)+(Number.isFinite(socialComponents.childSupport)?Number(socialComponents.childSupport):0)):null;
+    // Child-support funding is a separate payroll row and is not present on
+    // every historical slip. Its absence means "not listed on this slip", not
+    // "the whole social-insurance total is unreadable". If the label is present
+    // but its amount is missing, it is still reported as missing below.
+    const socialTotal=socialRequiredOk ? requiredSocialKeys.reduce((a,k)=>a+(Number(socialComponents[k])||0),0)+(Number.isFinite(socialComponents.childSupport)?Number(socialComponents.childSupport):0) : null;
     const grossComponents=[];
     const base=extractExactYenAfterLabel(text,['基準賃金等']);
     const commuting=extractExactYenAfterLabel(text,['通勤費補助']);
@@ -776,10 +800,16 @@ const FurusatoGoogleDrive = (() => {
     if(grossTotal==null)unknown.push('支給合計');
     if(nonTaxableTotal==null)unknown.push('非課税分');
     if(taxableBase==null)unknown.push('課税対象額');
-    for(const k of ['employmentInsurance','healthInsurance','healthInsuranceSpecial','nursingCare','pension','childSupport']){
+    for(const k of ['employmentInsurance','healthInsurance','healthInsuranceSpecial','nursingCare','pension']){
       if(!Number.isFinite(socialComponents[k]))unknown.push(`社会保険料:${k}`);
     }
-    const arithmeticOk=derivedTaxable!=null&&explicitTaxable!=null&&derivedTaxable===explicitTaxable;
+    // Only require child-support when the PDF actually contains that label.
+    // This preserves the distinction between "not applicable/not listed" and
+    // "label exists but amount could not be extracted".
+    const rawForPresence=String(typeof text==='string'?text:text?.text||'');
+    const childLabelPresent=/子ども[・\s]*子育て支援金/.test(rawForPresence.replace(/[（）()]/g,''));
+    if(childLabelPresent&&!Number.isFinite(socialComponents.childSupport))unknown.push('社会保険料:childSupport');
+    const arithmeticOk=(derivedTaxable!=null&&explicitTaxable!=null&&derivedTaxable===explicitTaxable) || (grossTotal!=null&&nonTaxableTotal!=null&&explicitTaxable==null&&grossTotal-nonTaxableTotal>=0);
     return {grossTotal,taxableGross:taxableBase,explicitTaxableGross:explicitTaxable,nonTaxableTotal,socialComponents,socialTotal,grossComponents,unknownComponents:unknown,arithmeticOk,needsReview:unknown.length>0||!arithmeticOk};
   }
   function parseSalaryPdf(text,name){
@@ -817,22 +847,25 @@ const FurusatoGoogleDrive = (() => {
       const socialOk=requiredSocialKeys.every(k=>Number.isFinite(c.socialComponents?.[k]));
       const socialTotal=(socialOk?requiredSocialKeys.reduce((a,k)=>a+(Number(c.socialComponents?.[k])||0),0)+(Number.isFinite(c.socialComponents?.childSupport)?Number(c.socialComponents.childSupport):0):null);
       const unknown=[...(c.grossTotal==null?['支給合計']:[]),...(c.nonTaxableTotal==null?['非課税分']:[]),...(c.taxableGross==null?['課税対象額']:[])];
-      for(const k of [...requiredSocialKeys,'childSupport'])if(!Number.isFinite(c.socialComponents?.[k]))unknown.push(`社会保険料:${k}`);
+      for(const k of requiredSocialKeys)if(!Number.isFinite(c.socialComponents?.[k]))unknown.push(`社会保険料:${k}`);
+      const ocrChildLabelPresent=/子ども[・\s]*子育て支援金/.test(String(a.text||'').replace(/[（）()]/g,''));
+      if(ocrChildLabelPresent&&!Number.isFinite(c.socialComponents?.childSupport))unknown.push('社会保険料:childSupport');
       c={...c,socialTotal,unknownComponents:unknown,arithmeticOk:derived!=null&&c.taxableGross===derived&&socialOk,needsReview:!(derived!=null&&c.taxableGross===derived&&socialOk)};
     }
     const taxableGross=Number.isFinite(c.taxableGross)&&c.taxableGross>0?c.taxableGross:null;
     const grossTotal=Number.isFinite(c.grossTotal)&&c.grossTotal>0?c.grossTotal:null;
     const requiredSocialKeys=['employmentInsurance','healthInsurance','healthInsuranceSpecial','nursingCare','pension'];
-    const childSupportRequired=Number(d.year)>2026 || (Number(d.year)===2026 && Number(d.month)>=4);
-    const socialOk=requiredSocialKeys.every(k=>Number.isFinite(c.socialComponents?.[k])) && (!childSupportRequired || Number.isFinite(c.socialComponents?.childSupport));
+    const rawForPresence=String(typeof text==='string'?text:text?.text||'');
+    const childSupportLabelPresent=/子ども[・\s]*子育て支援金/.test(rawForPresence.replace(/[（）()]/g,''));
+    const socialOk=requiredSocialKeys.every(k=>Number.isFinite(c.socialComponents?.[k])) && (!childSupportLabelPresent || Number.isFinite(c.socialComponents?.childSupport));
     const socialTotal=socialOk ? (requiredSocialKeys.reduce((a,k)=>a+(Number(c.socialComponents?.[k])||0),0) + (Number.isFinite(c.socialComponents?.childSupport)?Number(c.socialComponents.childSupport):0)) : null;
     const missing=[...(c.grossTotal==null?['支給合計']:[]),...(c.nonTaxableTotal==null?['非課税分']:[]),...(taxableGross==null?['課税対象額']:[])];
     for(const k of requiredSocialKeys)if(!Number.isFinite(c.socialComponents?.[k]))missing.push(`社会保険料:${k}`);
-    if(childSupportRequired&&!Number.isFinite(c.socialComponents?.childSupport))missing.push('社会保険料:childSupport');
+    if(childSupportLabelPresent&&!Number.isFinite(c.socialComponents?.childSupport))missing.push('社会保険料:childSupport');
     const derived=(grossTotal!=null&&c.nonTaxableTotal!=null)?grossTotal-c.nonTaxableTotal:null;
     const arithmeticOk=derived!=null&&taxableGross===derived;
     const needsReview=!(arithmeticOk&&socialOk);
-    return {year:d.year,month:d.month,gross:taxableGross,taxableGross,grossTotal,nonTaxableTotal:c.nonTaxableTotal,social:socialTotal,socialComponents:c.socialComponents,components:c.grossComponents,unknownComponents:missing,source:'google-drive',status:'actual',document:name,needsReview};
+    return {year:d.year,month:d.month,gross:taxableGross,taxableGross,grossTotal,nonTaxableTotal:c.nonTaxableTotal,social:socialTotal,socialComponents:c.socialComponents,childSupportLabelPresent,components:c.grossComponents,unknownComponents:missing,source:'google-drive',status:'actual',document:name,needsReview};
   }
   function filenameDateFallback(name){
     const n=String(name||'');
@@ -1105,7 +1138,7 @@ const FurusatoGoogleDrive = (() => {
     }
     return false;
   }
-  const PARSED_DB_VERSION='20260925-db5';
+  const PARSED_DB_VERSION='20260925-db6';
   function documentSignature(f){return `${f.id||f.name||''}|${f.modifiedTime||''}|${f.size||''}`;}
   function archiveYear(state,year){
     const y=Number(year); if(!Number.isFinite(y)||y<2024||y>2100)return null;
@@ -1135,7 +1168,7 @@ const FurusatoGoogleDrive = (() => {
       for(const d of (a?.documents||[])){
         if(String(d.driveFileId||d.id||d.name||'')!==key)continue;
         const sameSignature=d.signature===documentSignature(f);
-        const complete=d.parserVersion===PARSED_DB_VERSION && d.readData?.version==='20260925-readout3' && (String(d.readData?.pdfText||'').length>0 || String(d.readData?.ocrText||'').length>0) && Array.isArray(d.readData?.lines) && Array.isArray(d.missingFields) && d.missingFields.length===0;
+        const complete=d.parserVersion===PARSED_DB_VERSION && d.readData?.version==='20260925-readout4' && (String(d.readData?.pdfText||'').length>0 || String(d.readData?.ocrText||'').length>0) && Array.isArray(d.readData?.lines) && Array.isArray(d.missingFields) && d.missingFields.length===0;
         if(sameSignature&&complete)return {year:Number(yk),detail:d};
       }
     }
@@ -1153,7 +1186,9 @@ const FurusatoGoogleDrive = (() => {
   function salaryMissing(x){
     const missing=[...(x.year?[]:['年']),...(x.month?[]:['月']),...(Number(x.grossTotal)>0?[]:['支給合計']),...(x.nonTaxableTotal!=null?[]:['非課税分']),...(Number(x.taxableGross)>0?[]:['課税対象額'])];
     for(const k of ['employmentInsurance','healthInsurance','healthInsuranceSpecial','nursingCare','pension'])if(!Number.isFinite(x.socialComponents?.[k]))missing.push(`社会保険料:${k}`);
-    if(Number(x.year)>2026 || (Number(x.year)===2026 && Number(x.month)>=4)){if(!Number.isFinite(x.socialComponents?.childSupport))missing.push('社会保険料:childSupport');}
+    // Child-support is shown only on slips that contain that payroll row. Do
+    // not label a historical slip as incomplete merely because the row is absent.
+    if(x.childSupportLabelPresent&&!Number.isFinite(x.socialComponents?.childSupport))missing.push('社会保険料:childSupport');
     return [...new Set(missing)];
   }
   function bonusMissing(x){return [...new Set([...(x.year?[]:['年']),...(x.date?[]:['支給日']),...(Number(x.amount)>0?[]:['賞与額']),...(x.season?[]:['夏冬区分'])])];}
