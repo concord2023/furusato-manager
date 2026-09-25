@@ -33,6 +33,7 @@ if(typeof window!=='undefined')window.FurusatoImport=FurusatoImport;if(typeof mo
  */
 const FurusatoGoogleDrive = (() => {
   const CLIENT_KEY='furusatoGoogleClientId';
+  const RUNTIME_BUILD='2026-09-26-v40';
   const SCOPES='https://www.googleapis.com/auth/drive.readonly';
   let tokenClient=null, accessToken=null;
   let readyPromise=null;
@@ -325,7 +326,7 @@ const FurusatoGoogleDrive = (() => {
       }
     }
     return {
-      version:'20260925-readout7',
+      version:'20260926-readout8',
       document:String(name||''),
       pdfText,
       ocrText,
@@ -1234,7 +1235,7 @@ const FurusatoGoogleDrive = (() => {
     }
     return false;
   }
-  const PARSED_DB_VERSION='20260925-db9';
+  const PARSED_DB_VERSION='20260926-v40-db1';
   function documentSignature(f){return `${f.id||f.name||''}|${f.modifiedTime||''}|${f.size||''}`;}
   function archiveYear(state,year){
     const y=Number(year); if(!Number.isFinite(y)||y<2024||y>2100)return null;
@@ -1264,7 +1265,7 @@ const FurusatoGoogleDrive = (() => {
       for(const d of (a?.documents||[])){
         if(String(d.driveFileId||d.id||d.name||'')!==key)continue;
         const sameSignature=d.signature===documentSignature(f);
-        const complete=d.parserVersion===PARSED_DB_VERSION && d.readData?.version==='20260925-readout7' && (String(d.readData?.pdfText||'').length>0 || String(d.readData?.ocrText||'').length>0) && Array.isArray(d.readData?.lines) && Array.isArray(d.missingFields) && d.missingFields.length===0;
+        const complete=d.parserVersion===PARSED_DB_VERSION && d.readData?.version==='20260926-readout8' && d.needsReview!==true && !d.ocrError && (String(d.readData?.pdfText||'').length>0 || String(d.readData?.ocrText||'').length>0) && Array.isArray(d.readData?.lines) && Array.isArray(d.missingFields) && d.missingFields.length===0;
         if(sameSignature&&complete)return {year:Number(yk),detail:d};
       }
     }
@@ -1378,7 +1379,7 @@ const FurusatoGoogleDrive = (() => {
     t.forecastSalary=[];t.forecastSocial=[];t.forecastBonus=0;t.forecastBonusBreakdown=[];t.bonusSocialRecords=t.bonusSocialRecords.filter(x=>x.status==='actual');
     return {year:y,mode:'actual',archive,record,state:t,result:FurusatoCalculator.calc(t)};
   }
-  return {buildYearCalculationState,CLIENT_KEY,getClientId,setClientId,ready,authorize,signOut,listCandidateFiles,scanAndImport,classifyPdfText,parseSalaryPdf,parseBonusPdf,parseWithholdingPdf,extractLabeledNumber,extractToyotaPayrollAmount,extractExactYenAfterLabel,upsertSalaryRecord,upsertBonusRecord,ensurePdfText,getRuntimeDiagnostics,clearRuntimeDiagnostics,getLastOcrImageDataUrl:()=>lastOcrImageDataUrl};
+  return {buildYearCalculationState,RUNTIME_BUILD,CLIENT_KEY,getClientId,setClientId,ready,authorize,signOut,listCandidateFiles,scanAndImport,classifyPdfText,parseSalaryPdf,parseBonusPdf,parseWithholdingPdf,extractLabeledNumber,extractToyotaPayrollAmount,extractExactYenAfterLabel,upsertSalaryRecord,upsertBonusRecord,ensurePdfText,getRuntimeDiagnostics,clearRuntimeDiagnostics,getLastOcrImageDataUrl:()=>lastOcrImageDataUrl};
 })();
 if(typeof window!=='undefined')window.FurusatoGoogleDrive=FurusatoGoogleDrive;
 if(typeof module!=='undefined')module.exports={FurusatoImport,FurusatoGoogleDrive};
