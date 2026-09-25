@@ -325,7 +325,7 @@ const FurusatoGoogleDrive = (() => {
       }
     }
     return {
-      version:'20260925-readout6',
+      version:'20260925-readout7',
       document:String(name||''),
       pdfText,
       ocrText,
@@ -721,13 +721,47 @@ const FurusatoGoogleDrive = (() => {
     }
     return null;
   }
+  function extractToyotaSalarySummary(textOrPdf){
+    const raw=String(typeof textOrPdf==='string'?textOrPdf:textOrPdf?.text||'');
+    const out={taxableGross:null,grossTotal:null,nonTaxableTotal:null};
+    const re=/課税対象額/g; let m;
+    while((m=re.exec(raw))){
+      const tail=raw.slice(m.index+m[0].length,m.index+m[0].length+520);
+      if(!/支給合計/.test(tail))continue;
+      const stop=tail.search(/健康保険料|雇用保険料|所得税|住民税/);
+      const block=stop>=0?tail.slice(0,stop):tail;
+      const vals=extractNumericTokens(block).map(x=>x.n).filter(n=>!(n>=1900&&n<=2100));
+      if(vals.length>=3){out.taxableGross=vals[0];out.grossTotal=vals[1];out.nonTaxableTotal=vals[2];break;}
+    }
+    return out;
+  }
+  function extractToyotaSalarySocial(textOrPdf){
+    const raw=String(typeof textOrPdf==='string'?textOrPdf:textOrPdf?.text||'');
+    const out={employmentInsurance:null,healthInsurance:null,healthInsuranceSpecial:null,nursingCare:null,childSupport:null,pension:null};
+    const emp=/雇用保険料[ \u3000]*([0-9][0-9,]*)/.exec(raw);
+    if(emp)out.employmentInsurance=Number(emp[1].replace(/,/g,''));
+    const start=raw.search(/健康保険料[（(]基本/);
+    if(start<0)return out;
+    const tail=raw.slice(start,start+420);
+    const end=tail.search(/所得税|住民税|控除合計|加算明細/);
+    const block=end>=0?tail.slice(0,end):tail;
+    const vals=extractNumericTokens(block).map(x=>x.n).filter(n=>!(n>=1900&&n<=2100));
+    const child=/子ども[・\s]*子育て支援金/.test(block.replace(/[（）()]/g,''));
+    if(child && vals.length>=5){
+      [out.healthInsurance,out.healthInsuranceSpecial,out.nursingCare,out.childSupport,out.pension]=vals.slice(0,5);
+    }else if(!child && vals.length>=4){
+      [out.healthInsurance,out.healthInsuranceSpecial,out.nursingCare,out.pension]=vals.slice(0,4);
+    }
+    return out;
+  }
   function parseSalaryComponents(text){
     const s=cleanPdfText(typeof text==='string'?text:text?.text||'');
     // Structured summary fields are authoritative. Parse them by exact label,
     // not by visual-nearest-number heuristics: the slip contains many other
     // amounts (bank transfers, standard remuneration, deductions, etc.).
-    let grossTotal=extractExactYenAfterLabel(text,['支給合計（A)','支給合計(A)','Total Payment']);
-    let nonTaxableTotal=extractExactYenAfterLabel(text,['（内通勤補助費等非課税分)','(内通勤補助費等非課税分)','Non-taxable Amount','Non‑taxable Amount','Non-taxabl e Anount','Non‑taxabl e Anount','Non-taxable Anount']);
+    const toyotaSummary=extractToyotaSalarySummary(text);
+    let grossTotal=toyotaSummary.grossTotal ?? extractExactYenAfterLabel(text,['支給合計（A)','支給合計(A)','Total Payment']);
+    let nonTaxableTotal=toyotaSummary.nonTaxableTotal ?? extractExactYenAfterLabel(text,['（内通勤補助費等非課税分)','(内通勤補助費等非課税分)','Non-taxable Amount','Non‑taxable Amount','Non-taxabl e Anount','Non‑taxabl e Anount','Non-taxable Anount']);
     // Prefer the Japanese summary label. The PDF header also contains the
     // phrase "Taxable amount from January"; treating that as the field label
     // can grab an unrelated nearby number (this is what made April look like
@@ -735,9 +769,9 @@ const FurusatoGoogleDrive = (() => {
     // label when the Japanese label is genuinely absent.
     const rawSalaryForLabel=String(typeof text==='string'?text:text?.text||'');
     const hasJapaneseTaxableLabel=/課税対象額/.test(rawSalaryForLabel);
-    let explicitTaxable=hasJapaneseTaxableLabel
+    let explicitTaxable=toyotaSummary.taxableGross ?? (hasJapaneseTaxableLabel
       ? extractExactYenAfterLabel(text,['課税対象額'])
-      : extractExactYenAfterLabel(text,['Taxable Amount']);
+      : extractExactYenAfterLabel(text,['Taxable Amount']));
     // Toyota monthly payroll slips do NOT use the same "支給合計(A)" label as
     // the bonus slip.  The reliable summary is "課税対象額" + "非課税分".
     // The old parser treated the missing "支給合計(A)" as a fatal error and
@@ -800,8 +834,9 @@ const FurusatoGoogleDrive = (() => {
       return null;
     };
     const socialComponents={};
+    const toyotaSocial=extractToyotaSalarySocial(text);
     for(const [k,labels] of Object.entries(socialLabels)){
-      socialComponents[k]=extractExactYenAfterLabel(text,labels);
+      socialComponents[k]=Number.isFinite(toyotaSocial[k])?toyotaSocial[k]:extractExactYenAfterLabel(text,labels);
       if(!Number.isFinite(socialComponents[k]))socialComponents[k]=flexibleSameLineAmount(text,labels);
     }
     const requiredSocialKeys=['employmentInsurance','healthInsurance','healthInsuranceSpecial','nursingCare','pension'];
@@ -954,14 +989,35 @@ const FurusatoGoogleDrive = (() => {
     }
     return null;
   }
+  function extractToyotaBonusSocial(textOrPdf){
+    const raw=String(typeof textOrPdf==='string'?textOrPdf:textOrPdf?.text||'');
+    const out={employmentInsurance:null,healthInsurance:null,healthInsuranceSpecial:null,nursingCare:null,childSupport:null,pension:null};
+    const start=raw.search(/雇用保険料/);
+    if(start<0)return out;
+    const tail=raw.slice(start,start+1200);
+    const pensionLabel=tail.search(/年金保険料/);
+    if(pensionLabel<0)return out;
+    const valueArea=tail.slice(pensionLabel+'年金保険料'.length);
+    const end=valueArea.search(/標準賞与額|※社会保険料/);
+    const block=end>=0?valueArea.slice(0,end):valueArea;
+    const vals=extractNumericTokens(block).map(x=>x.n).filter(n=>!(n>=1900&&n<=2100));
+    const child=/子ども[・\s]*子育て支援金/.test(tail.replace(/[（）()]/g,''));
+    if(child && vals.length>=6){
+      [out.employmentInsurance,out.healthInsurance,out.healthInsuranceSpecial,out.nursingCare,out.childSupport,out.pension]=vals.slice(0,6);
+    }else if(!child && vals.length>=5){
+      [out.employmentInsurance,out.healthInsurance,out.healthInsuranceSpecial,out.nursingCare,out.pension]=vals.slice(0,5);
+    }
+    return out;
+  }
   function parseBonusPdf(text,name){
     const raw=typeof text==='string'?text:(text?.text||''); const d=extractDateParts(raw,name);
     let amount=extractExactYenAfterLabel(text,['支給額','支給合計（A)','支給合計(A)','Total Payment']);
     const taxableGross=extractExactYenAfterLabel(text,['課税対象額','Taxable Amount']) ?? amount;
     const socialLabels={employmentInsurance:['雇用保険料'],healthInsurance:['健康保険料（基本）','健康保険料 (基本)','健康保険料（基本'],healthInsuranceSpecial:['健康保険料（特定）','健康保険料 (特定)','健康保険料（特定'],nursingCare:['介護保険料'],childSupport:['子ども・子育て支援金','子ども 子育て支援金','子ども子育て支援金'],pension:['年金保険料','厚生年金保険料']};
     const socialComponents={};
+    const toyotaBonusSocial=extractToyotaBonusSocial(text);
     for(const [k,labels] of Object.entries(socialLabels)){
-      socialComponents[k]=extractExactYenAfterLabel(text,labels);
+      socialComponents[k]=Number.isFinite(toyotaBonusSocial[k])?toyotaBonusSocial[k]:extractExactYenAfterLabel(text,labels);
       if(!Number.isFinite(socialComponents[k])){
         const raw=typeof text==='string'?text:String(text?.text||'');
         const compact=v=>String(v||'').replace(/[\s\u3000()（）「」［］【】・･:：]/g,'').toLowerCase();
@@ -993,8 +1049,22 @@ const FurusatoGoogleDrive = (() => {
       if(tri){amount=amount??tri.amount;deduction=deduction??tri.deduction;if(net==null||net===amount||net!==tri.net)net=tri.net;}
     }
     const socialValues=Object.values(socialComponents); const social=socialValues.every(v=>Number.isFinite(v))?socialValues.reduce((a,v)=>a+v,0):null;
-    const standardHealth=extractThousandAfterLabel(text,['健康保険/介護保険','健康保険／介護保険']);
-    const standardPension=extractThousandAfterLabel(text,['厚生年金保険（150万/回）','厚生年金保険 (150万/回)','厚生年金保険（150万／回）']);
+    let standardHealth=extractThousandAfterLabel(text,['健康保険/介護保険','健康保険／介護保険']);
+    let standardPension=extractThousandAfterLabel(text,['厚生年金保険（150万/回）','厚生年金保険 (150万/回)','厚生年金保険（150万／回）']);
+    const stdStart=raw.search(/標準賞与額/);
+    if(stdStart>=0){
+      const stdTail=raw.slice(stdStart,stdStart+700);
+      const welfareIdx=stdTail.search(/Welfare Pension Insurance/);
+      if(welfareIdx>=0){
+        const vals=[...stdTail.slice(welfareIdx).matchAll(/(?<!\d)(\d{1,3}(?:,\d{3})?|\d+)(?!\d)/g)]
+          .map(m=>Number(m[1].replace(/,/g,'')))
+          .filter(n=>n<10000&&!(n>=1900&&n<=2100));
+        // The three values are: standard bonus amount, health/nursing base,
+        // welfare-pension base. The labels above contain the 573万/150万 caps,
+        // so parsing from the English value-section avoids those metadata numbers.
+        if(vals.length>=3){standardHealth=vals[1];standardPension=vals[2];}
+      }
+    }
     const derivedNet=(amount!=null&&deduction!=null)?amount-deduction:null;
     const netConflict=derivedNet!=null && ((transferNet!=null && transferNet!==derivedNet) || (transferNet==null && labelNet!=null && labelNet!==derivedNet));
     if(derivedNet!=null)net=derivedNet;
@@ -1164,7 +1234,7 @@ const FurusatoGoogleDrive = (() => {
     }
     return false;
   }
-  const PARSED_DB_VERSION='20260925-db8';
+  const PARSED_DB_VERSION='20260925-db9';
   function documentSignature(f){return `${f.id||f.name||''}|${f.modifiedTime||''}|${f.size||''}`;}
   function archiveYear(state,year){
     const y=Number(year); if(!Number.isFinite(y)||y<2024||y>2100)return null;
@@ -1194,7 +1264,7 @@ const FurusatoGoogleDrive = (() => {
       for(const d of (a?.documents||[])){
         if(String(d.driveFileId||d.id||d.name||'')!==key)continue;
         const sameSignature=d.signature===documentSignature(f);
-        const complete=d.parserVersion===PARSED_DB_VERSION && d.readData?.version==='20260925-readout6' && (String(d.readData?.pdfText||'').length>0 || String(d.readData?.ocrText||'').length>0) && Array.isArray(d.readData?.lines) && Array.isArray(d.missingFields) && d.missingFields.length===0;
+        const complete=d.parserVersion===PARSED_DB_VERSION && d.readData?.version==='20260925-readout7' && (String(d.readData?.pdfText||'').length>0 || String(d.readData?.ocrText||'').length>0) && Array.isArray(d.readData?.lines) && Array.isArray(d.missingFields) && d.missingFields.length===0;
         if(sameSignature&&complete)return {year:Number(yk),detail:d};
       }
     }
