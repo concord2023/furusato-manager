@@ -8,4 +8,4 @@
 <script>
 document.addEventListener('DOMContentLoaded',()=>{const box=document.getElementById('yearLinks');const first=Math.min(2024,Number(state.year)||new Date().getFullYear());const last=Math.max(2026,Number(state.year)||new Date().getFullYear());const rec=state.yearRecords||{};box.innerHTML=Array.from({length:last-first+1},(_,i)=>first+i).map(y=>{const r=rec[String(y)]||{};const status=r.withholding?'● 源泉徴収票あり・確定': '○ 手動入力・未確定';return `<a class="subcard" style="display:block;text-decoration:none;margin:10px 0" href="year-${y}.html"><h3>${y}年</h3><p class="note">${status}</p><p>年度ページを開く →</p></a>`}).join('')});
 </script>
-<script>if('serviceWorker' in navigator)navigator.serviceWorker.register('service-worker.js?build=20260925-readout5').catch(()=>{});</script></body></html>
+<script>if('serviceWorker' in navigator)navigator.serviceWorker.register('service-worker.js?build=20260925-readout6').catch(()=>{});</script></body></html>
