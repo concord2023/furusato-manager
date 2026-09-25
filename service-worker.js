@@ -1,4 +1,4 @@
-const BUILD='20260926-v40';
+const BUILD='20260926-v44';
 const CACHE=`furusato-manager-${BUILD}`;
 const ASSETS=['./','./index.html','./details.html','./donations.html','./settings.html','./year-history.html','./year-2024.html','./year-2025.html','./year-2026.html','./year-detail.html','./limit-2024.html','./limit-2025.html','./limit-2026.html','./year-detail.js','./yearly-page.js','./yearly-history.js','./data-database.html','./import_readout.html','./style.css','./app.js','./calculator.js','./data-model.js','./integration.js','./manifest.json'];
 const LOCAL_SCHEME=/^(https?:)?\/\//;
